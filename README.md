@@ -90,142 +90,177 @@ make is_equal = (5 + 5) == 10
 make message = "Hello " + "World"
 ```
 
+### i
+
+```st
+// Counted loop
+loop 5 {
+    write("Iteration")
+}
+
+// Loop with counter variable
+loop 10 with i {
+    write("Number: " + i)
+}
+```
+
 ### How to run .st Files
 
 ```bash
 slate run (yourfile.st)
 ```
+## Extensions
 
-## Slattery UI
+### Slattery(UI)
 
-### Create a New Slattery Application
+Slattery is a UI framework extension for SlateScript. It adds native GUI capabilities using the egui library. The extension system allows Slattery to hook into the language without modifying the core parser/interpreter.
 
-```bash
-slate slattery new my_app
-```
+#### Import UI Components
 
-### Create UI Components
+import from "slattery" {Window, Column, Row, Text, Button, Input, Identity, Rewrite}
+
+#### Window
 
 ```st
-import from "slattery" {Window, Column, Text, Button}
+Window {
+    title: "My App",
+    width: 480,
+    height: 320,
+    Child: <Text> { value: "Hello" }
+}
+```
+
+#### Column
+
+```st
+Column {
+    spacing: 10,
+    Child: <Text> { value: "Item 1" },
+    Child: <Text> { value: "Item 2" }
+}
+```
+
+#### Row
+
+```st
+Row {
+    spacing: 10,
+    Child: <Button> { label: "Left" },
+    Child: <Button> { label: "Right" }
+}
+```
+
+#### Text
+
+```st
+Text {
+    value: "Hello World",
+    Identity: welcome_text
+}
+```
+
+Properties:
+
+- value - Text content
+
+- Identity - ID for STS styling
+
+- class - STS class
+
+#### Button
+
+```st
+Button {
+    label: "Click Me",
+    Identity: my_button,
+    on_click: handle_click
+}
+```
+
+#### Input
+
+```st
+Input {
+    placeholder: "Enter text...",
+    Identity: name_input,
+    on_change: handle_input
+}
+```
+
+- value - Current value
+
+- placeholder - Placeholder text
+
+- Identity - ID for CSS styling
+
+- on_change - Called when value changes
+
+#### Full Example
+
+```st
+import from "slattery" {Window, Column, Text, Button, Input, Identity, Rewrite}
 
 make App = Window {
-    title: "My Application",
+    title: "Slattery Demo",
     Child: <Column> {
+        spacing: 16,
+        
         Child: <Text> {
             value: "Welcome to Slattery!",
-            Identity: welcome_text
+            Identity: title_text
         },
+        
+        Child: <Text> {
+            value: "Enter your name:",
+            Identity: prompt_text
+        },
+        
+        Child: <Input> {
+            placeholder: "Your name...",
+            Identity: name_input,
+            on_change: handle_name
+        },
+        
         Child: <Button> {
-            label: "Click Me",
-            on_click: handle_click
+            label: "Say Hello",
+            on_click: say_hello
+        },
+        
+        Child: <Button> {
+            label: "Reset",
+            on_click: reset
         }
     }
 }
 
-func handle_click<> {
-    write("Button was clicked!")
+func handle_name<name> {
+    // Store the name
+}
+
+func say_hello<> {
+    // Use Rewrite to update the title
+    Rewrite<title_text, "value", "Hello, " + name_input>
+}
+
+func reset<> {
+    Rewrite<title_text, "value", "Welcome to Slattery!">
 }
 ```
 
-### Styling(sts)
+#### Commands
 
-```sts
-/* Component styles */
-@Text {
-    color: #1A1A1A;
-    font-size: 18px;
-}
-
-@Button {
-    background-color: #FF3B30;
-    color: white;
-    border-radius: 8px;
-}
-
-@Button:hover {
-    background-color: #FF6B60;
-}
-
-/* ID-based styles */
-#welcome_text {
-    color: #FF3B30;
-    font-size: 24px;
-    font-weight: bold;
-}
-
-/* Class-based styles */
-.highlight {
-    background-color: yellow;
-    font-weight: bold;
-}
-
-@Window {
-    background-color: #FFFFFF;
-}
+```cmd
+slate slattery run main.st
 ```
 
-Component properties
-
-- title |	Window title | title: "My App"
-- value |	Text content |	value: "Hello"
-- label |	Button label |	label: "Submit"
-- Identity | Component ID (for CSS) |	Identity: my_button
-- on_click	| Click event handler |	on_click: my_function
-- Child	Nested | child component |	Child: <Text> {...}
-- children |	Array of children |	children: [<Text>, <Button>]
-
-UI Components
-
-- Window:	Main application window
-- Column:	Vertical layout container
-- Row:	Horizontal layout container
-- Text:	Text label with styling support
-- Button:	Clickable button with events
-- Input:	Text input field
-
-## Developer Tools
-
-- Press | Ctrl+Shift+I | to view slattery dev tools
-
-## SLIT Package Manager
-
-### Install a package
-
-```bash
-slate slit install math-utils
+```cmd
+slate slattery new app
 ```
 
-### List installed packages
-
-```bash
-slate slit list
+```cmd
+slate slattery build app
 ```
 
-### Search for packages
-
-```bash
-slate slit search math
 ```
-
-### Initialize package config
-
-```bash
-slate slit init
+slate slattery clean app
 ```
-
-### Command sheet
-
-- slate run <file>:	Execute a SlateScript file
-- slate slattery new <name>:	Create a new Slattery app
-- slate slit install <pkg>:	Install a package
-- slate slit list:	List installed packages
-- slate slit search [query]:	Search for packages
-- slate slit init:	Initialize package config
-- slate version:	Show version information
-- slattery run <file>:	Run a Slattery app (standalone)
-- slattery new <name>:	Create a Slattery app (standalone)
-
-### License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
