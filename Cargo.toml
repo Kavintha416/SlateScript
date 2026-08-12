@@ -1,0 +1,25 @@
+[package]
+name = "slate"
+version = "0.1.0"
+edition = "2021"
+description = "SlateScript Programming Language CLI"
+default-run = "slate"
+
+[[bin]]
+name = "slate"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+egui = "0.24.0"
+eframe = { version = "0.24.0", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+] }
+image = "0.24.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }

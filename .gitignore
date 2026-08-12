@@ -1,0 +1,95 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+*.rlib
+*.dylib
+*.dll
+*.exe
+*.exp
+*.lib
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.~*
+*.sublime-*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# SlateScript specific
+*.st.cache
+*.sts.cache
+/slate-packages.toml
+slate-packages.lock
+.slate/
+.slattery/
+
+# Build artifacts
+release/
+debug/
+dist/
+build/
+
+# Logs
+*.log
+logs/
+*.tmp
+
+# Documentation generated
+/docs/_build/
+/docs/html/
+/docs/latex/
+
+# Test artifacts
+/tests/fixtures/output/
+*.actual
+*.expected
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+# Package distribution (keep source only, not compiled)
+*.zip
+*.tar.gz
+*.7z
+*.deb
+*.rpm
+*.msi
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Coverage reports
+*.prof
+*.gcda
+*.gcno
+*.gcov
+target/cov/
+coverage/
+*.lcov
+
+# Debugging
+*.dSYM/
+*.pdb
+*.idb
+*.ilk
+*.map

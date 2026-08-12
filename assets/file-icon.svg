@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <path d="M6 2L18 2L26 10L26 28C26 29.1 25.1 30 24 30H8C6.9 30 6 29.1 6 28L6 2Z" fill="#1E293B"/>
+  <path d="M18 2L18 10L26 10" fill="#0F172A"/>
+  <text x="16" y="22" 
+        font-family="'JetBrains Mono', monospace" 
+        font-size="9" 
+        font-weight="700" 
+        fill="#DC2626" 
+        text-anchor="middle">
+    >st
+  </text>
+</svg>

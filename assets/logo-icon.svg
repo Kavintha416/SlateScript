@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect width="200" height="200" fill="#0F172A" rx="24"/>
+  <text x="100" y="115" 
+        font-family="'JetBrains Mono', 'Fira Code', monospace" 
+        font-size="72" 
+        font-weight="400" 
+        fill="#DC2626" 
+        text-anchor="middle" 
+        dominant-baseline="middle">
+    >st
+  </text>
+</svg>
