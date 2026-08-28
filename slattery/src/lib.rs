@@ -10,8 +10,8 @@ pub mod ui_integration;
 pub mod styles;
 pub mod ui_extension;
 pub mod logger;
-pub mod button_hander;
-pub use button_hander::ButtonHandler;
+pub mod button_handler;
+pub use button_handler::ButtonHandler;
 // 2. Use slate-core types directly
 use slate_core::extension::LanguageExtension;
 use slate_core::ast::Expression;

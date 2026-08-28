@@ -1,19 +1,20 @@
-// slattery/src/button_hander.rs
+// slattery/src/button_handler.rs
 
 use slate_core::ast_interpreter::AstInterpreter;
 use slate_core::value::Value;
 use slate_core::lexer::Token;
+use std::collections::HashMap;
 
 pub struct ButtonHandler {
     pub interpreter: AstInterpreter,
-    pub function_cache: std::collections::HashMap<String, Vec<Token>>,
+    pub function_cache: HashMap<String, Vec<Token>>,
 }
 
 impl ButtonHandler {
     pub fn new() -> Self {
         Self {
             interpreter: AstInterpreter::new(),
-            function_cache: std::collections::HashMap::new(),
+            function_cache: HashMap::new(),
         }
     }
 

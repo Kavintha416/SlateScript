@@ -3,6 +3,7 @@
 //! Manages style rules, cascading, and provides style resolution for components.
 
 use std::collections::HashMap;
+use egui;
 use super::style_interpreter::{StyleRule, StyleValue, StyleState, StyleInterpreter};
 
 #[derive(Clone)]

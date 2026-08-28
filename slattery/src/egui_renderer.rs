@@ -2,6 +2,7 @@
 
 use crate::sla_interpreter::{UiComponent, UiValue};
 use crate::styles::{StyleApplier, StyleEngine};
+use crate::styles::style_interpreter::StyleValue;
 use crate::logger::DevLogger;
 use slate_core::ast_interpreter::AstInterpreter;
 use slate_core::value::Value;
@@ -114,7 +115,7 @@ impl EguiRenderer {
         self
     }
 
-    pub fn new_with_handler(button_handler: crate::button_hander::ButtonHandler) -> Self {
+    pub fn new_with_handler(button_handler: crate::button_handler::ButtonHandler) -> Self {
         let mut renderer = Self::new();
         renderer.function_cache = button_handler.function_cache;
         renderer.interpreter = button_handler.interpreter;
@@ -1226,14 +1227,14 @@ impl SlatteryApp {
 }
 
 // Helper function to format style values
-fn format_style_value(value: &crate::styles::StyleValue) -> String {
+fn format_style_value(value: &StyleValue) -> String {
     match value {
-        crate::styles::StyleValue::Color(c) => format!("color: {}", c),
-        crate::styles::StyleValue::Number(n) => format!("number: {}", n),
-        crate::styles::StyleValue::String(s) => format!("string: {}", s),
-        crate::styles::StyleValue::Unit(n, unit) => format!("unit: {}{}", n, unit),
-        crate::styles::StyleValue::Boolean(b) => format!("bool: {}", b),
-        crate::styles::StyleValue::None => "none".to_string(),
+        StyleValue::Color(c) => format!("color: {}", c),
+        StyleValue::Number(n) => format!("number: {}", n),
+        StyleValue::String(s) => format!("string: {}", s),
+        StyleValue::Unit(n, unit) => format!("unit: {}{}", n, unit),
+        StyleValue::Boolean(b) => format!("bool: {}", b),
+        StyleValue::None => "none".to_string(),
     }
 }
 
