@@ -136,17 +136,21 @@ func reset<> {
 ## Commands
 
 ```cmd
+# not needed you can run the normal slate command
 slate slattery run main.st
 ```
 
 ```cmd
+# to create a new app
 slate slattery new app
 ```
 
 ```cmd
+#to build an app
 slate slattery build app
 ```
 
 ```
+#to clean the app
 slate slattery clean app
 ```
