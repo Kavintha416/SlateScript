@@ -3,5 +3,3 @@ slate slattery run main.st
 
 cargo build --release
 target/release/slate.exe run "examples/sfile example/main.st"
-
-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
