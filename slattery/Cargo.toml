@@ -1,0 +1,13 @@
+[package]
+name = "slattery"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Slattery UI Framework for SlateScript"
+
+[dependencies]
+slate-core = { path = "../slate-core" }
+slate-sfile = { path = "../slate-sfile" }
+egui = "0.36"
+eframe = "0.36"
+image = "0.24"

@@ -40,7 +40,7 @@ Beware that this is an experimental release and most features are yet to come
 ### Print Statements
 
 ```st
-write("hello")
+write("Hello, World!")
 ```
 
 ### Variables
@@ -53,11 +53,11 @@ make age = 20
 ### Functions
 
 ```st
-func greeting<name: string> {
-  write("hello, " + name)
+func greet<name> {
+    write("Hello, " + name + "!")
 }
 
-greeting<"world">
+greet<"world">
 ```
 
 ### Control Flow

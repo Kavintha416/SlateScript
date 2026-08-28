@@ -1,0 +1,13 @@
+[package]
+name = "slate-sfile"
+version = "0.1.0"
+edition = "2021"
+description = "File import extension for SlateScript - allows importing other .st files"
+license = "MIT"
+
+[dependencies]
+slate-core = { path = "../slate-core" }
+
+[lib]
+name = "slate_sfile"
+path = "src/lib.rs"
