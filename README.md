@@ -106,6 +106,30 @@ loop 10 with i {
 
 ### How to run .st Files
 
+you can run using the executable by specifying the path
+
+```bash
+slate.exe run (yourfile.st)
+```
+
+or installing it via path by
+
 ```bash
 slate run (yourfile.st)
+```
+
+### How to install to path?
+
+```bash
+# Add to User PATH (doesn't need admin)
+$SLATE_PATH = "C:\Users\$env:USERNAME\SlateScript\target\release"
+
+[Environment]::SetEnvironmentVariable(
+    "Path", 
+    [Environment]::GetEnvironmentVariable("Path", "User") + ";$SLATE_PATH",
+    "User"
+)
+
+# Restart terminal and test
+slate --version
 ```
