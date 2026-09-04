@@ -4,6 +4,7 @@ use crate::sla_lexer::UiLexer;
 use crate::sla_interpreter::UiInterpreter;
 use crate::egui_renderer::EguiRenderer;
 use slate_core::lexer::Token;
+use slate_core::value::Value;
 use std::path::Path;
 use slate_sfile::SFileExtension;
 use std::io::Write;
@@ -51,8 +52,7 @@ impl UiFramework {
             }
         }
         
-        println!("[DEBUG] Total components transferred: {}", component_map.len());
-        std::io::Write::flush(&mut std::io::stdout()).unwrap_or_default();
+
         
         let mut renderer = crate::egui_renderer::EguiRenderer::new();
         renderer.set_components(component_map);
@@ -62,8 +62,6 @@ impl UiFramework {
         
         // Register functions from interpreter
         for (func_name, func_tokens) in &self.interpreter.functions {
-            println!("[DEBUG] Registering UI function: {}", func_name);
-            
             let main_tokens = convert_ui_tokens_to_main_tokens(func_tokens);
             
             let mut func_def_tokens = Vec::new();
@@ -91,10 +89,21 @@ impl UiFramework {
             
             renderer.function_cache.insert(func_name.clone(), func_def_tokens.clone());
             
+            // Register write function with flush
+            renderer.interpreter.register_native_function("write".to_string(), Box::new(|args| {
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        print!(" ");
+                    }
+                    print!("{}", arg.to_string());
+                }
+                println!();
+                Write::flush(&mut std::io::stdout()).unwrap_or_default();
+                Ok(Value::Null)
+            }));
+            
             if let Err(e) = renderer.interpreter.run(&func_def_tokens) {
-                eprintln!("[DEBUG] Interpreter registration failed: {}", e);
-            } else {
-                println!("[OK] Registered function: {}", func_name);
+                eprintln!("Interpreter registration failed: {}", e);
             }
         }
         
@@ -136,8 +145,6 @@ impl UiFramework {
                                 }
                                 
                                 self.sfile_extension.import_files(&file_paths)?;
-                                
-                                println!("[DEBUG] Imported files: {:?}", file_paths);
                             }
                         }
                     }
@@ -155,7 +162,6 @@ impl UiFramework {
         for (path, _) in loaded_files {
             if let Ok(source) = std::fs::read_to_string(&path) {
                 renderer.load_styles_from_source(&source);
-                println!("[DEBUG] Loaded styles from: {}", path.display());
             }
         }
         
@@ -166,8 +172,6 @@ impl UiFramework {
         let imported_functions = self.sfile_extension.get_all_imported_functions();
         
         for (name, params, body) in imported_functions {
-            println!("[DEBUG] Registering imported function: {}", name);
-            
             let mut func_tokens = Vec::new();
             func_tokens.push(Token::Func);
             func_tokens.push(Token::Identifier(name.clone()));
@@ -248,7 +252,12 @@ fn convert_ui_tokens_to_main_tokens(tokens: &[crate::sla_lexer::UiToken]) -> Vec
     for token in tokens {
         match token {
             crate::sla_lexer::UiToken::Identifier(name) => {
-                result.push(Token::Identifier(name.clone()));
+                // Check if it's a known function name
+                if name == "write" {
+                    result.push(Token::Write);
+                } else {
+                    result.push(Token::Identifier(name.clone()));
+                }
             }
             crate::sla_lexer::UiToken::String(s) => {
                 result.push(Token::String(s.clone()));
@@ -298,6 +307,12 @@ fn convert_ui_tokens_to_main_tokens(tokens: &[crate::sla_lexer::UiToken]) -> Vec
             }
             crate::sla_lexer::UiToken::EqualEqual => {
                 result.push(Token::EqualEqual);
+            }
+            crate::sla_lexer::UiToken::Rewrite => {
+                result.push(Token::Rewrite);
+            }
+            crate::sla_lexer::UiToken::Func => {
+                result.push(Token::Func);
             }
             _ => {}
         }

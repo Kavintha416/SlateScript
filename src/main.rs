@@ -62,8 +62,6 @@ fn main() {
 
     match cli.command {
         Commands::Run { file, extensions: _extensions } => {
-            println!("[DEBUG] Running file: {:?}", file);
-            
             if !file.exists() {
                 eprintln!("[ERROR] File not found: {:?}", file);
                 process::exit(1);
@@ -74,8 +72,6 @@ fn main() {
                     let has_ui = has_ui_syntax(&source);
                     
                     if has_ui {
-                        println!("[INFO] Detected UI syntax, using Slattery UI framework...");
-                        
                         let mut ui_framework = slattery::ui_integration::UiFramework::new();
                         
                         match ui_framework.parse_and_render(&source, Some(&file)) {
@@ -88,7 +84,6 @@ fn main() {
                             }
                         }
                     } else {
-                        println!("[INFO] Running as regular script...");
                         if let Err(e) = slate_core::run_file(&file) {
                             eprintln!("[ERROR] {}", e);
                             process::exit(1);
@@ -140,8 +135,6 @@ fn handle_slattery_command(command: SlatteryCommands) -> Result<(), String> {
             Ok(())
         }
         SlatteryCommands::Run { file } => {
-            println!("[INFO] Running Slattery app from: {}", file.display());
-            
             let source = std::fs::read_to_string(&file)
                 .map_err(|e| format!("Failed to read file: {}", e))?;
             

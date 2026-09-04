@@ -35,7 +35,6 @@ impl StyleApplier {
             if path.extension().and_then(|ext| ext.to_str()) == Some("st") {
                 let path_str = path.to_string_lossy();
                 self.engine.borrow_mut().load_from_file(&path_str)?;
-                println!("[INFO] Loaded styles from: {}", path_str);
             }
         }
         Ok(())

@@ -4,6 +4,7 @@ use slate_core::ast_interpreter::AstInterpreter;
 use slate_core::value::Value;
 use slate_core::lexer::Token;
 use std::collections::HashMap;
+use std::io::Write;
 
 pub struct ButtonHandler {
     pub interpreter: AstInterpreter,
@@ -19,16 +20,11 @@ impl ButtonHandler {
     }
 
     pub fn register_function(&mut self, name: &str, tokens: Vec<Token>) {
-        println!("[ButtonHandler] Registering function: {}", name);
         self.function_cache.insert(name.to_string(), tokens);
     }
 
     pub fn execute_handler(&mut self, handler_name: &str, _args: &[Value]) -> Result<(), String> {
-        println!("[ButtonHandler] Executing handler: {}", handler_name);
-        
         if let Some(tokens) = self.function_cache.get(handler_name).cloned() {
-            println!("[ButtonHandler] Found tokens for handler: {} ({} tokens)", handler_name, tokens.len());
-            
             // Register native functions needed for execution
             self.interpreter.register_native_function("write".to_string(), Box::new(|args| {
                 for (i, arg) in args.iter().enumerate() {
@@ -38,6 +34,7 @@ impl ButtonHandler {
                     print!("{}", arg.to_string());
                 }
                 println!();
+                Write::flush(&mut std::io::stdout()).unwrap_or_default();
                 Ok(Value::Null)
             }));
             
@@ -47,11 +44,9 @@ impl ButtonHandler {
             
             // Run the function body
             if let Err(e) = self.interpreter.run(&tokens) {
-                println!("[ButtonHandler] Error executing handler: {}", e);
                 return Err(e);
             }
             
-            println!("[ButtonHandler] Handler '{}' executed successfully", handler_name);
             return Ok(());
         }
 

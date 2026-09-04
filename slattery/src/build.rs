@@ -14,34 +14,44 @@ pub struct BuildConfig {
 impl BuildConfig {
     pub fn new(app_name: &str, output_dir: &str, release: bool) -> Result<Self, String> {
         println!("[DEBUG] BuildConfig::new called with app_name: {}", app_name);
-        
-        let app_root = if Path::new(app_name).exists() {
-            PathBuf::from(app_name)
+
+        // Resolve and canonicalize the app root up front so every subsequent
+        // operation works with an absolute, normalised path.
+        let raw = PathBuf::from(app_name);
+        let candidate = if raw.is_absolute() {
+            raw
         } else {
-            let current = std::env::current_dir()
-                .map_err(|e| format!("Failed to get current dir: {}", e))?;
-            let possible = current.join(app_name);
-            if possible.exists() {
-                possible
-            } else {
-                return Err(format!("App '{}' not found", app_name));
-            }
+            std::env::current_dir()
+                .map_err(|e| format!("Failed to get current dir: {}", e))?
+                .join(app_name)
         };
-        
+
+        if !candidate.exists() {
+            return Err(format!("App '{}' not found at '{}'", app_name, candidate.display()));
+        }
+
+        // Canonicalize strips any trailing separators and resolves symlinks.
+        // On Windows this also strips the \\?\ prefix we strip manually elsewhere.
+        let app_root = strip_unc(
+            fs::canonicalize(&candidate)
+                .unwrap_or(candidate)
+        );
+
         println!("[DEBUG] app_root: {}", app_root.display());
 
         let project_name = read_project_name(&app_root)?;
         println!("[DEBUG] project_name from Slattery.toml: {}", project_name);
-        
-        let final_name = if project_name == "." || project_name.is_empty() {
-            app_root.file_name()
+
+        let final_name = if project_name.is_empty() || project_name == "." {
+            app_root
+                .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .to_string()
+                .into_owned()
         } else {
             project_name
         };
-        
+
         println!("[DEBUG] final_name: {}", final_name);
 
         Ok(Self {
@@ -50,6 +60,19 @@ impl BuildConfig {
             release,
             app_root,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: strip the \\?\ extended-length prefix Windows adds after
+// canonicalize(), because Cargo and most tools do not accept it.
+// ---------------------------------------------------------------------------
+fn strip_unc(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        PathBuf::from(&s[4..])
+    } else {
+        p
     }
 }
 
@@ -66,9 +89,12 @@ fn read_project_name(app_root: &Path) -> Result<String, String> {
 
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with("name = ") {
+        if line.starts_with("name =") {
             let name = line
-                .trim_start_matches("name = ")
+                .splitn(2, '=')
+                .nth(1)
+                .unwrap_or("")
+                .trim()
                 .trim_matches('"')
                 .trim_matches('\'')
                 .to_string();
@@ -79,10 +105,12 @@ fn read_project_name(app_root: &Path) -> Result<String, String> {
         }
     }
 
-    let folder_name = app_root.file_name()
+    // Fallback to the directory name.
+    let folder_name = app_root
+        .file_name()
         .unwrap_or_default()
         .to_string_lossy()
-        .to_string();
+        .into_owned();
     println!("[DEBUG] Using folder name as fallback: {}", folder_name);
     Ok(folder_name)
 }
@@ -102,7 +130,7 @@ pub fn build_app(config: &BuildConfig) -> Result<(), String> {
     let src_path = config.app_root.join("src").join("main.st");
     if !src_path.exists() {
         return Err(format!(
-            "App '{}' not found. Run 'slate slattery new {}' first.",
+            "src/main.st not found in '{}'. Run 'slate slattery new {}' first.",
             config.app_root.display(),
             config.app_name
         ));
@@ -120,11 +148,9 @@ pub fn build_app(config: &BuildConfig) -> Result<(), String> {
     fs::create_dir_all(&build_src_dir)
         .map_err(|e| format!("Failed to create build src dir: {}", e))?;
 
-    // Copy .st source files only
+    // Copy .st source files (recursive so subdirectories are included).
     copy_directory(&config.app_root.join("src"), &build_src_dir, "st")?;
     println!("  [OK] Copied source files");
-
-    // Styles are embedded in .st files - no separate copy needed
 
     let assets_src = config.app_root.join("assets");
     let assets_dest = build_dir.join("assets");
@@ -156,115 +182,152 @@ pub fn build_app(config: &BuildConfig) -> Result<(), String> {
 
     println!("+-------------------------------------------+");
     println!("[OK] Build complete!");
-    println!("  Executable: {}/{}", config.output_dir.display(), get_exe_name(&config.app_name));
-    println!("  Run: ./{}/{}", config.output_dir.display(), get_exe_name(&config.app_name));
+    println!(
+        "  Executable: {}{}{}",
+        config.output_dir.display(),
+        std::path::MAIN_SEPARATOR,
+        get_exe_name(&config.app_name)
+    );
     println!("+-------------------------------------------+");
 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Locate the SlateScript project root.
+//
+// Strategy (in order of preference):
+//   1. $SLATE_HOME environment variable
+//   2. Walk up from the running executable's directory
+//   3. Walk up from the current working directory
+//
+// Hard-coded OS-specific paths are intentionally omitted — they break the
+// moment someone installs to a non-default location. $SLATE_HOME is the
+// right escape hatch for unusual setups.
+// ---------------------------------------------------------------------------
 pub fn find_slate_dir() -> Result<PathBuf, String> {
-    // Check SLATE_HOME first
+    // 1. Explicit override.
     if let Ok(dir) = std::env::var("SLATE_HOME") {
-        let path = PathBuf::from(dir);
-        if path.join("Cargo.toml").exists() {
+        let path = strip_unc(PathBuf::from(&dir));
+        if is_slate_root(&path) {
             return Ok(path);
         }
+        // Warn but don't hard-fail — fall through to auto-detection.
+        eprintln!(
+            "[WARN] SLATE_HOME is set to '{}' but no valid Cargo.toml found there.",
+            dir
+        );
     }
 
-    // Check current executable path
+    // 2. Walk up from the running executable.
     if let Ok(exe_path) = std::env::current_exe() {
-        let mut current = exe_path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-        
-        for _ in 0..10 {
-            if current.join("Cargo.toml").exists() {
-                let content = fs::read_to_string(current.join("Cargo.toml"))
-                    .unwrap_or_default();
-                if content.contains("name = \"slate\"") {
-                    return Ok(current);
-                }
-            }
-            if !current.pop() {
-                break;
-            }
+        // exe_path.parent() is None only for a bare filename with no directory
+        // component (extremely unlikely in practice but guard anyway).
+        let start = exe_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Some(found) = walk_up_for_slate_root(&start) {
+            return Ok(found);
         }
     }
 
-    // Check current directory
-    let mut current = std::env::current_dir()
+    // 3. Walk up from the current working directory.
+    let cwd = std::env::current_dir()
         .map_err(|e| format!("Failed to get current directory: {}", e))?;
+    if let Some(found) = walk_up_for_slate_root(&cwd) {
+        return Ok(found);
+    }
 
-    for _ in 0..10 {
-        if current.join("Cargo.toml").exists() {
-            let content = fs::read_to_string(current.join("Cargo.toml"))
-                .unwrap_or_default();
-            if content.contains("name = \"slate\"") {
-                return Ok(current);
-            }
+    Err(
+        "Could not find the SlateScript project directory.\n\
+         Set the SLATE_HOME environment variable to the SlateScript project root."
+            .to_string(),
+    )
+}
+
+/// Walk upward from `start`, returning the first directory that looks like the
+/// SlateScript project root (has a Cargo.toml whose package name is "slate").
+fn walk_up_for_slate_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    for _ in 0..15 {
+        if is_slate_root(&current) {
+            return Some(strip_unc(current));
         }
         if !current.pop() {
             break;
         }
     }
-
-    // Check common locations based on OS
-    #[cfg(windows)]
-    let common_paths = vec![
-        std::env::var("USERPROFILE").unwrap_or_default() + "\\Desktop\\SlateScript-main",
-        std::env::var("USERPROFILE").unwrap_or_default() + "\\SlateScript",
-        "C:\\Program Files\\SlateScript".to_string(),
-    ];
-
-    #[cfg(unix)]
-    let common_paths = vec![
-        std::env::var("HOME").unwrap_or_default() + "/SlateScript",
-        std::env::var("HOME").unwrap_or_default() + "/Desktop/SlateScript-main",
-    ];
-
-    for path in common_paths {
-        let p = PathBuf::from(path);
-        if p.join("Cargo.toml").exists() {
-            let content = fs::read_to_string(p.join("Cargo.toml"))
-                .unwrap_or_default();
-            if content.contains("name = \"slate\"") {
-                return Ok(p);
-            }
-        }
-    }
-
-    Err("Could not find SlateScript project directory. Please set SLATE_HOME environment variable to the SlateScript project path.".to_string())
+    None
 }
 
+/// Returns true when `dir` is the SlateScript project root.
+fn is_slate_root(dir: &Path) -> bool {
+    let cargo_toml = dir.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return false;
+    }
+    fs::read_to_string(&cargo_toml)
+        .map(|c| {
+            // Match the exact package name declaration to avoid false positives
+            // from workspace members like slate-core or slattery.
+            c.contains("name = \"slate\"")
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// File copy helpers
+// ---------------------------------------------------------------------------
+
+/// Recursively copy every file with the given extension from `src` into `dest`,
+/// preserving the relative sub-directory structure.
 fn copy_directory(src: &Path, dest: &Path, ext: &str) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
     }
 
-    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {}", src.display(), e))? {
+    for entry in
+        fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {}", src.display(), e))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(extension) = path.extension() {
-                if extension == ext {
-                    let dest_path = dest.join(path.file_name().unwrap());
-                    fs::copy(&path, &dest_path)
-                        .map_err(|e| format!("Failed to copy {}: {}", path.display(), e))?;
-                }
+
+        if path.is_dir() {
+            // Recurse into subdirectory, mirroring the structure under dest.
+            let sub_dest = dest.join(path.file_name().unwrap());
+            fs::create_dir_all(&sub_dest)
+                .map_err(|e| format!("Failed to create dir {}: {}", sub_dest.display(), e))?;
+            copy_directory(&path, &sub_dest, ext)?;
+        } else if path.is_file() {
+            if path.extension().map_or(false, |e| e == ext) {
+                let dest_path = dest.join(path.file_name().unwrap());
+                fs::copy(&path, &dest_path)
+                    .map_err(|e| format!("Failed to copy {}: {}", path.display(), e))?;
             }
         }
     }
     Ok(())
 }
 
+/// Recursively copy every file (regardless of extension) from `src` to `dest`.
 fn copy_all_files(src: &Path, dest: &Path) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
     }
 
-    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {}", src.display(), e))? {
+    for entry in
+        fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {}", src.display(), e))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let path = entry.path();
-        if path.is_file() {
+
+        if path.is_dir() {
+            let sub_dest = dest.join(path.file_name().unwrap());
+            fs::create_dir_all(&sub_dest)
+                .map_err(|e| format!("Failed to create dir {}: {}", sub_dest.display(), e))?;
+            copy_all_files(&path, &sub_dest)?;
+        } else if path.is_file() {
             let dest_path = dest.join(path.file_name().unwrap());
             fs::copy(&path, &dest_path)
                 .map_err(|e| format!("Failed to copy {}: {}", path.display(), e))?;
@@ -273,57 +336,70 @@ fn copy_all_files(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Cargo.toml generation
+//
+// Key decisions:
+//   • No [workspace] table — this is a standalone crate placed inside the
+//     SlateScript workspace's target/slattery_builds directory. Adding its
+//     own [workspace] would make it a second workspace root, which Cargo
+//     refuses when it's already inside another workspace.
+//   • The `slate` path dependency uses a forward-slash path (safe on all
+//     platforms) and is UNC-stripped so Cargo can parse it on Windows.
+// ---------------------------------------------------------------------------
 fn generate_cargo_toml(build_dir: &Path, app_name: &str, slate_dir: &Path) -> Result<(), String> {
-    let abs_build_dir = build_dir.canonicalize()
-        .unwrap_or_else(|_| build_dir.to_path_buf());
-    
+    // Canonicalize and strip the \\?\ prefix so the path is usable as a
+    // TOML string and Cargo accepts it on Windows.
+    let abs_build_dir = strip_unc(
+        fs::canonicalize(build_dir).unwrap_or_else(|_| build_dir.to_path_buf()),
+    );
     let cargo_path = abs_build_dir.join("Cargo.toml");
+
     println!("[DEBUG] Writing Cargo.toml to: {}", cargo_path.display());
-    println!("[DEBUG] app_name: {}", app_name);
-    
-    let final_name = if app_name == "." || app_name.is_empty() {
-        abs_build_dir.file_name()
+
+    let final_name = if app_name.is_empty() || app_name == "." {
+        abs_build_dir
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string()
+            .into_owned()
     } else {
         app_name.to_string()
     };
-    println!("[DEBUG] final_name: {}", final_name);
-    
+
+    // Convert to forward slashes for TOML portability.
     let slate_path = slate_dir.to_string_lossy().replace('\\', "/");
     println!("[DEBUG] slate_path: {}", slate_path);
-    
-    let content = format!(r#"[workspace]
-members = ["."]
 
-[package]
-name = "{}"
+    // Validate the name is a legal Cargo package name.
+    let safe_name = final_name.replace(' ', "-");
+
+    let content = format!(
+        r#"[package]
+name = "{name}"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-slate = {{ path = "{}" }}
+slate = {{ path = "{slate}" }}
 
 [target.'cfg(windows)'.dependencies]
 winapi = {{ version = "0.3", features = ["winuser"] }}
 
 [[bin]]
-name = "{}"
+name = "{name}"
 path = "src/main.rs"
 "#,
-        final_name,
-        slate_path,
-        final_name
+        name = safe_name,
+        slate = slate_path,
     );
 
     println!("[DEBUG] Cargo.toml content:\n{}", content);
 
-    fs::write(&cargo_path, content)
+    fs::write(&cargo_path, &content)
         .map_err(|e| format!("Failed to write Cargo.toml to {}: {}", cargo_path.display(), e))?;
-    
+
     println!("[DEBUG] Successfully wrote Cargo.toml to {}", cargo_path.display());
-    
     Ok(())
 }
 
@@ -384,12 +460,10 @@ fn main() {
 }
 
 fn compile_app(build_dir: &Path, release: bool) -> Result<(), String> {
-    let abs_path = std::fs::canonicalize(build_dir)
-        .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
-
-    let abs_path_str = abs_path.to_string_lossy().to_string();
-    let clean_path_str = abs_path_str.trim_start_matches("\\\\?\\");
-    let abs_path = PathBuf::from(clean_path_str);
+    let abs_path = strip_unc(
+        fs::canonicalize(build_dir)
+            .map_err(|e| format!("Failed to canonicalize path: {}", e))?,
+    );
 
     let cargo_toml_path = abs_path.join("Cargo.toml");
     if !cargo_toml_path.exists() {
@@ -407,8 +481,10 @@ fn compile_app(build_dir: &Path, release: bool) -> Result<(), String> {
         cmd.arg("--release");
     }
 
-    println!("[DEBUG] Running: cargo build{}", if release { " --release" } else { "" });
-    println!("[DEBUG] In directory: {}", abs_path.display());
+    println!(
+        "[DEBUG] Running: cargo build{}",
+        if release { " --release" } else { "" }
+    );
 
     let status = cmd
         .status()
@@ -421,12 +497,19 @@ fn compile_app(build_dir: &Path, release: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_executable(build_dir: &Path, output_dir: &Path, app_name: &str, release: bool) -> Result<(), String> {
+fn copy_executable(
+    build_dir: &Path,
+    output_dir: &Path,
+    app_name: &str,
+    release: bool,
+) -> Result<(), String> {
     fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create output dir: {}", e))?;
 
-    let abs_build_dir = std::fs::canonicalize(build_dir)
-        .map_err(|e| format!("Failed to canonicalize build dir: {}", e))?;
+    let abs_build_dir = strip_unc(
+        fs::canonicalize(build_dir)
+            .map_err(|e| format!("Failed to canonicalize build dir: {}", e))?,
+    );
 
     let target_dir = if release {
         abs_build_dir.join("target").join("release")
@@ -447,16 +530,14 @@ fn copy_executable(build_dir: &Path, output_dir: &Path, app_name: &str, release:
 
     println!("[OK] Executable copied to: {}", dest_path.display());
 
-    // Copy src/ next to the exe so run_file can find src/main.st
+    // Copy src/ next to the exe so run_file can find src/main.st.
     let src_dest = output_dir.join("src");
     fs::create_dir_all(&src_dest)
         .map_err(|e| format!("Failed to create output src dir: {}", e))?;
     copy_directory(&abs_build_dir.join("src"), &src_dest, "st")?;
     println!("[OK] Copied src/ next to executable");
 
-    // Styles are embedded in .st files - no separate copy needed
-
-    // Copy assets/ next to the exe (optional — only if present)
+    // Copy assets/ next to the exe (optional — only if present).
     let assets_src = abs_build_dir.join("assets");
     if assets_src.exists() {
         let assets_dest = output_dir.join("assets");
@@ -470,12 +551,9 @@ fn copy_executable(build_dir: &Path, output_dir: &Path, app_name: &str, release:
 }
 
 fn get_exe_name(app_name: &str) -> String {
-    #[cfg(windows)]
-    {
+    if cfg!(windows) {
         format!("{}.exe", app_name)
-    }
-    #[cfg(not(windows))]
-    {
+    } else {
         app_name.to_string()
     }
 }

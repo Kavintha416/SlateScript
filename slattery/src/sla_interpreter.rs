@@ -133,15 +133,11 @@ impl UiInterpreter {
 
         // Check if this is an event handler property
         if prop_name == "on_click" || prop_name == "on_tap" || prop_name == "on_change" || prop_name == "on_input" {
-            println!("[DEBUG] Parsing event handler for: {}", prop_name);
-            
             let handler_name = match tokens.get(i) {
                 Some(UiToken::Identifier(name)) => {
-                    println!("[DEBUG] Found handler: {}", name);
                     name.clone()
                 }
                 other => {
-                    println!("[DEBUG] Expected handler, got: {:?}", other);
                     return Err(format!(
                         "Expected handler identifier after {}:, got {:?}",
                         prop_name, other
@@ -150,8 +146,6 @@ impl UiInterpreter {
             };
             i += 1;
 
-            println!("[DEBUG] Setting event '{}' to handler '{}'", prop_name, handler_name);
-            
             component
                 .borrow_mut()
                 .set_event(prop_name.to_string(), handler_name);
@@ -732,13 +726,8 @@ impl UiInterpreter {
                         }
                     }
                     _ => {
-                        // Try to parse as a property
-                        if let Some((prop_name, value, new_i)) = self.parse_property(&tokens, i) {
-                            component.borrow_mut().set_property(prop_name, value);
-                            i = new_i;
-                        } else {
-                            i += 1;
-                        }
+                        // Try to parse as a property using the full property parser that handles events
+                        i = self.parse_property_into_component(&component, tokens, i)?;
                     }
                 }
 

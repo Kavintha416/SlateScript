@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::time::Instant;
-use std::path::Path;
+use std::io::Write;
 use egui;
 
 // ============================================================
@@ -124,7 +124,6 @@ impl EguiRenderer {
 
     pub fn set_components(&mut self, components: HashMap<String, Rc<RefCell<UiComponent>>>) {
         self.components = components;
-        self.logger.log_info(&format!("Loaded {} components", self.components.len()));
     }
 
     pub fn register_function(&mut self, name: &str, tokens: Vec<Token>) {
@@ -171,7 +170,7 @@ impl EguiRenderer {
                 if let Err(e) = self.style_engine.borrow_mut().parse_style_blocks(&content) {
                     self.logger.log_warn(&format!("Failed to load styles from {}: {}", file_path, e));
                 } else {
-                    self.logger.log_info(&format!("Loaded styles from: {}", file_path));
+
                 }
             }
         }
@@ -182,7 +181,7 @@ impl EguiRenderer {
         if let Err(e) = self.style_engine.borrow_mut().parse_style_blocks(source) {
             self.logger.log_warn(&format!("Failed to parse style blocks from source: {}", e));
         } else {
-            self.logger.log_info("Loaded style blocks from source");
+
         }
     }
 
@@ -214,29 +213,26 @@ impl EguiRenderer {
     // ============================================================
 
     pub fn execute_slate_function(&mut self, function_name: &str, args: &[Value]) -> Result<(), String> {
-        println!("[DEBUG] execute_slate_function called: {} with {:?} args", function_name, args);
-        
         // Check if function exists in cache
         if let Some(tokens) = self.function_cache.get(function_name).cloned() {
-            println!("[DEBUG] Found function '{}' in cache with {} tokens", function_name, tokens.len());
-            
-            // Log the tokens for debugging
-            for (i, token) in tokens.iter().enumerate() {
-                println!("[DEBUG]   Token {}: {:?}", i, token);
-            }
-            
             // Create a fresh interpreter for this execution
             let mut temp_interpreter = AstInterpreter::new();
             
             // Register native functions needed
-            temp_interpreter.register_native_function("write".to_string(), Box::new(|args| {
+            let logger = self.logger.clone();
+            temp_interpreter.register_native_function("write".to_string(), Box::new(move |args| {
+                let mut output = String::new();
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
-                        print!(" ");
+                        output.push(' ');
                     }
-                    print!("{}", arg.to_string());
+                    output.push_str(&arg.to_string());
                 }
-                println!();
+                // Print to stdout
+                println!("{}", output);
+                Write::flush(&mut std::io::stdout()).unwrap_or_default();
+                // Also log to devtools console
+                logger.log_info(&output);
                 Ok(Value::Null)
             }));
             
@@ -245,29 +241,22 @@ impl EguiRenderer {
             }));
             
             // Run the function tokens
-            println!("[DEBUG] Running function tokens through interpreter...");
             if let Err(e) = temp_interpreter.run(&tokens) {
-                println!("[DEBUG] Interpreter error: {}", e);
                 return Err(e);
             }
-            println!("[DEBUG] Interpreter execution successful");
             
             // Process any Rewrite statements
-            println!("[DEBUG] Processing Rewrite statements...");
             self.process_rewrite_statements(&tokens, args)?;
             
-            println!("[DEBUG] Handler '{}' execution completed", function_name);
             return Ok(());
         }
         
         // If not in cache, check if it's in the interpreter
         if self.interpreter.has_function(function_name) {
-            println!("[DEBUG] Function '{}' found in interpreter", function_name);
             // Try to execute using interpreter
             return Ok(());
         }
         
-        println!("[DEBUG] Function '{}' NOT FOUND", function_name);
         Err(format!("Function '{}' not found in interpreter", function_name))
     }
     
@@ -304,19 +293,15 @@ impl EguiRenderer {
     
     fn process_rewrite_statements(&mut self, tokens: &[Token], _args: &[Value]) -> Result<(), String> {
         let mut i = 0;
-        let mut found_rewrites = 0;
         
         while i < tokens.len() {
             match &tokens[i] {
                 Token::Rewrite => {
-                    println!("[DEBUG] Found Rewrite statement at position {}", i);
-                    found_rewrites += 1;
                     i += 1;
                     
                     // Next should be component identity
                     if i < tokens.len() {
                         if let Token::Identifier(component_id) = &tokens[i] {
-                            println!("[DEBUG] Rewrite target component: {}", component_id);
                             i += 1;
                             
                             // Next should be LeftBrace
@@ -328,7 +313,6 @@ impl EguiRenderer {
                                 
                                 while i < tokens.len() && !matches!(tokens[i], Token::RightBrace) {
                                     if let Token::Identifier(prop_name) = &tokens[i] {
-                                        println!("[DEBUG]   Property: {}", prop_name);
                                         i += 1;
                                         
                                         if i < tokens.len() && matches!(tokens[i], Token::Colon) {
@@ -366,7 +350,6 @@ impl EguiRenderer {
                                             
                                             // Evaluate the expression
                                             if let Some(value) = self.evaluate_expression(&value_tokens) {
-                                                println!("[DEBUG]   Value: {}", value);
                                                 properties_to_update.insert(prop_name.clone(), value);
                                             }
                                         }
@@ -377,10 +360,7 @@ impl EguiRenderer {
                                 
                                 // Apply the rewrite
                                 for (prop, value) in properties_to_update {
-                                    println!("[DEBUG] Rewriting component '{}' property '{}' = '{}'", 
-                                            component_id, prop, value);
                                     if let Err(e) = self.rewrite_component(component_id, &prop, &value) {
-                                        println!("[DEBUG] Failed to rewrite: {}", e);
                                         self.logger.log_warn(&format!("Failed to rewrite component: {}", e));
                                     }
                                 }
@@ -394,15 +374,10 @@ impl EguiRenderer {
             }
         }
         
-        if found_rewrites > 0 {
-            println!("[DEBUG] Processed {} rewrite statements", found_rewrites);
-        }
         Ok(())
     }
     
     fn evaluate_expression(&mut self, tokens: &[Token]) -> Option<String> {
-        println!("[DEBUG] Evaluating expression: {:?}", tokens);
-        
         // Simple evaluation for now
         let mut result = String::new();
         let mut i = 0;
@@ -601,43 +576,24 @@ impl EguiRenderer {
             }
 
             "Button" => {
-                println!("[DEBUG] Button rendering - component: {:?}", comp.component_type);
-                println!("[DEBUG] Button events: {:?}", comp.events);
-                println!("[DEBUG] Button identity: {:?}", comp.identity);
-                println!("[DEBUG] Button properties: {:?}", comp.properties);
-                
                 let clicked = self.style_applier.apply_button_styles(&comp, ui);
                 
                 if clicked {
-                    println!("[DEBUG] Button CLICKED!");
-                    
                     // Get the on_click handler
                     if let Some(handler_name) = comp.events.get("on_click").cloned() {
-                        println!("[DEBUG] Found on_click handler: {}", handler_name);
-                        
                         // Build arguments from properties
                         let mut args = Vec::new();
                         if let Some(UiValue::String(arg)) = comp.get_property("arg") {
                             args.push(Value::String(arg.clone()));
                         }
                         
-                        // Log before execution
-                        self.logger.log_info(&format!("Button clicked - executing: {}", handler_name));
-                        
                         // Execute the handler
                         match self.execute_slate_function(&handler_name, &args) {
-                            Ok(_) => {
-                                println!("[DEBUG] Handler '{}' executed successfully", handler_name);
-                                self.logger.log_info(&format!("Handler '{}' executed successfully", handler_name));
-                            }
+                            Ok(_) => {}
                             Err(e) => {
-                                println!("[DEBUG] Handler '{}' failed: {}", handler_name, e);
                                 self.logger.log_error(&format!("Handler '{}' failed: {}", handler_name, e));
                             }
                         }
-                    } else {
-                        println!("[DEBUG] No on_click handler found!");
-                        self.logger.log_warn("Button clicked but no on_click handler defined");
                     }
                 }
             }
@@ -663,13 +619,10 @@ impl EguiRenderer {
                     self.ui_state.insert(format!("input_{}", id), text.clone());
                     
                     if let Some(handler_name) = comp.events.get("on_change").cloned() {
-                        self.logger.log_info(&format!("Input changed - executing: {}", handler_name));
                         let args = vec![Value::String(text.clone())];
                         
                         match self.execute_slate_function(&handler_name, &args) {
-                            Ok(_) => {
-                                self.logger.log_info(&format!("Handler '{}' executed successfully", handler_name));
-                            }
+                            Ok(_) => {}
                             Err(e) => {
                                 self.logger.log_error(&format!("on_change handler '{}' failed: {}", handler_name, e));
                             }
@@ -765,8 +718,6 @@ impl EguiRenderer {
     }
 
     pub fn rewrite_component(&mut self, identity: &str, property: &str, value: &str) -> Result<(), String> {
-        println!("[DEBUG] rewrite_component called: {} property={} value={}", identity, property, value);
-        
         if let Some(comp) = self.get_component_by_identity(identity) {
             let mut comp_borrowed = comp.borrow_mut();
             comp_borrowed.set_property(property.to_string(), UiValue::String(value.to_string()));
@@ -776,12 +727,10 @@ impl EguiRenderer {
                 self.ui_state.insert(identity.to_string(), value.to_string());
             }
             
-            println!("[DEBUG] Successfully rewrote component");
             self.logger.log_debug(&format!("Rewrote component '{}' property '{}' = '{}'", identity, property, value));
             Ok(())
         } else {
             let msg = format!("Component '{}' not found", identity);
-            println!("[DEBUG] {}", msg);
             self.logger.log_debug(&msg);
             Err(msg)
         }
@@ -867,11 +816,6 @@ impl eframe::App for SlatteryApp {
             i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::I)
         }) {
             self.devtools_open = !self.devtools_open;
-            if self.devtools_open {
-                self.renderer.logger.log_info("DevTools opened");
-            } else {
-                self.renderer.logger.log_info("DevTools closed");
-            }
         }
 
         // ============================================================
