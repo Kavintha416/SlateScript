@@ -192,14 +192,14 @@ pub enum Expression {
 pub enum Statement {
     /// Expression statements (standalone expressions)
     Expression(Expression),
-    
+
     /// Variable assignments (let x = 5)
     Assignment {
         name: String,
         value: Expression,
         span: Span,
     },
-    
+
     /// Function definitions
     FunctionDefinition {
         name: String,
@@ -207,7 +207,7 @@ pub enum Statement {
         body: Vec<Statement>,
         span: Span,
     },
-    
+
     /// If statements with elif support
     If {
         condition: Expression,
@@ -216,7 +216,7 @@ pub enum Statement {
         else_branch: Option<Vec<Statement>>,
         span: Span,
     },
-    
+
     /// While loops
     While {
         condition: Expression,
@@ -224,31 +224,56 @@ pub enum Statement {
         counter_var: Option<String>,
         span: Span,
     },
-    
+
     /// Write statements (console output)
     Write {
         value: Expression,
         span: Span,
     },
-    
+
     /// Import statements
     ImportStatement {
         from: String,
         items: Vec<String>,
         span: Span,
     },
-    
+
     /// Return statements
     Return {
         value: Option<Expression>,
         span: Span,
     },
-    
+
     /// Train statements for machine learning
     Train {
         model: Expression,
         dataset: Expression,
         config: HashMap<String, Expression>,
+        span: Span,
+    },
+
+    // ============ NEW ============
+
+    /// `#[name]` followed by a statement.
+    ///
+    /// The interpreter looks up `annotation` in the annotation registry
+    /// and calls its `evaluate` method with `inner`. The annotation
+    /// produces a value that the interpreter binds to the name in
+    /// `inner` (if `inner` is an assignment).
+    Annotated {
+        annotation: String,
+        inner: Box<Statement>,
+        span: Span,
+    },
+
+    /// `obj.field = value` (or a nested path like `a.b.c = value`).
+    ///
+    /// The `target` expression must resolve to a property chain rooted
+    /// at a variable. At execution time the interpreter mutates the
+    /// root binding.
+    PropertyAssignment {
+        target: Expression,
+        value: Expression,
         span: Span,
     },
 }
@@ -291,6 +316,8 @@ impl SpannedNode for Statement {
             Statement::ImportStatement { span, .. } => *span,
             Statement::Return { span, .. } => *span,
             Statement::Train { span, .. } => *span,
+            Statement::Annotated { span, .. } => *span,
+            Statement::PropertyAssignment { span, .. } => *span,
         }
     }
 }
@@ -312,6 +339,7 @@ impl SpannedNode for Expression {
             Expression::UiComponent { span, .. } => *span,
             Expression::UiRender { span, .. } => *span,
             Expression::Extension { span, .. } => *span,
+            
         }
     }
 }

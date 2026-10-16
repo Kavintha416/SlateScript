@@ -1,41 +1,38 @@
+# ─────────────────────────────────────────────────────────────
+#  Package: the `slate` binary itself
+# ─────────────────────────────────────────────────────────────
 [package]
 name = "slate"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "SlateScript Programming Language"
+rust-version = "1.75"
 
 [[bin]]
 name = "slate"
 path = "src/main.rs"
 
 [dependencies]
-slate-core = { path = "./slate-core" }
-slattery = { path = "./slattery" }
-slate-sfile = { path = "./slate-sfile" }
-clap = { version = "4.4", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+slate-core   = { path = "crates/slate-core" }
+slate-sfile  = { path = "crates/slate-sfile" }
+slattery     = { path = "crates/slattery" }
 
+# ─────────────────────────────────────────────────────────────
+#  Workspace
+# ─────────────────────────────────────────────────────────────
 [workspace]
 resolver = "2"
 members = [
-    ".",
-    "slate-core",
-    "slattery",
-    "slate-sfile",
+    "crates/slate-core",
+    "crates/slate-sfile",
+    "crates/slattery",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "SlateScript Programming Language"
+rust-version = "1.75"
 
 [workspace.dependencies]
-clap = { version = "4.4", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"

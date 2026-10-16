@@ -9,5 +9,5 @@ description = "Slattery UI Framework for SlateScript"
 slate-core = { path = "../slate-core" }
 slate-sfile = { path = "../slate-sfile" }
 egui = "0.36"
-eframe = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 image = "0.24"

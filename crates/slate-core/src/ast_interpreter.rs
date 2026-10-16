@@ -25,7 +25,8 @@ pub struct AstInterpreter {
     max_call_depth: usize,
     max_iterations: usize,
     extensions: RefCell<Option<ExtensionRegistry>>,
-    current_file: Option<PathBuf>,  // Add this field
+    current_file: Option<PathBuf>,
+    annotations: crate::annotation::AnnotationRegistry,   // NEW
 }
 
 impl AstInterpreter {
@@ -56,7 +57,8 @@ impl AstInterpreter {
             max_call_depth: 1000,
             max_iterations: 100000,
             extensions: RefCell::new(None),
-            current_file: None,  // Initialize
+            current_file: None,
+            annotations: crate::annotation::AnnotationRegistry::new(),   // NEW
         };
         interpreter.register_native_functions();
         interpreter
@@ -166,7 +168,7 @@ impl AstInterpreter {
             if args.len() != 1 {
                 return Err("type() expects exactly 1 argument".to_string());
             }
-            let type_name = match args[0] {
+            let type_name = match &args[0] {
                 Value::String(_) => "string",
                 Value::Int(_) => "int",
                 Value::Float(_) => "float",
@@ -174,6 +176,7 @@ impl AstInterpreter {
                 Value::Null => "null",
                 Value::Array(_) => "array",
                 Value::Object(_) => "object",
+                Value::Struct { .. } => "struct",
             };
             Ok(Value::String(type_name.to_string()))
         }));
@@ -248,19 +251,121 @@ impl AstInterpreter {
         Ok(Value::Null)
     }
 
+    /// Assign `value` to the given target expression.
+    ///
+    /// The target must be a variable or a chain of property accesses
+    /// rooted at a variable. For nested targets like `a.b.c`, we mutate
+    /// the innermost struct and write it back up the chain.
+    fn assign_to_target(&mut self, target: &Expression, value: Value) -> Result<(), String> {
+        match target {
+            Expression::Variable(name, _) => {
+                self.environment.set(name, value);
+                Ok(())
+            }
+            Expression::PropertyAccess { object, property, .. } => {
+                // Evaluate the object (a clone of the current value).
+                let mut obj = self.evaluate_expression(object)?;
+
+                // Mutate the property on the clone.
+                match &mut obj {
+                    Value::Object(fields) => {
+                        fields.insert(property.clone(), value);
+                    }
+                    Value::Struct { fields, .. } => {
+                        fields.insert(property.clone(), value);
+                    }
+                    other => {
+                        return Err(format!(
+                            "Cannot assign to field '{}' of `{}`",
+                            property,
+                            other.to_string()
+                        ));
+                    }
+                }
+
+                // Write the mutated clone back up the chain.
+                self.write_back(object, obj)
+            }
+            _ => Err("Invalid assignment target".to_string()),
+        }
+    }
+
+    /// Recursive write-back for `assign_to_target`.
+    fn write_back(&mut self, target: &Expression, new_value: Value) -> Result<(), String> {
+        match target {
+            Expression::Variable(name, _) => {
+                self.environment.set(name, new_value);
+                Ok(())
+            }
+            Expression::PropertyAccess { object, property, .. } => {
+                let mut parent = self.evaluate_expression(object)?;
+                match &mut parent {
+                    Value::Object(fields) => {
+                        fields.insert(property.clone(), new_value);
+                    }
+                    Value::Struct { fields, .. } => {
+                        fields.insert(property.clone(), new_value);
+                    }
+                    other => {
+                        return Err(format!(
+                            "Cannot assign through `{}`",
+                            other.to_string()
+                        ));
+                    }
+                }
+                self.write_back(object, parent)
+            }
+            _ => Err("Invalid assignment chain".to_string()),
+        }
+    }
+
     pub fn execute_statement(&mut self, statement: &Statement) -> Result<ControlFlow, String> {
         match statement {
             Statement::Expression(expr) => {
                 self.evaluate_expression(expr)?;
                 Ok(ControlFlow::Continue)
             }
-            
+
             Statement::Assignment { name, value, span: _ } => {
                 let val = self.evaluate_expression(value)?;
                 self.environment.set(name, val);
                 Ok(ControlFlow::Continue)
             }
-            
+
+            Statement::PropertyAssignment { target, value, .. } => {
+                let val = self.evaluate_expression(value)?;
+                self.assign_to_target(target, val)?;
+                Ok(ControlFlow::Continue)
+            }
+
+            Statement::Annotated { annotation, inner, .. } => {
+                // Clone the annotation so we don't hold a borrow on `self` while
+                // we call `evaluate(&mut self, ...)`.
+                let annot = self.annotations.get(annotation)
+                    .map(|a| a.clone_box())
+                    .ok_or_else(|| {
+                        format!(
+                            "Unknown annotation '#[{}]'. Known annotations: {:?}",
+                            annotation,
+                            self.annotations.names()
+                        )
+                    })?;
+
+                // Now `self` is free to be borrowed mutably.
+                let value = annot.evaluate(inner, self)?;
+
+                match inner.as_ref() {
+                    Statement::Assignment { name, .. } => {
+                        self.environment.set(name, value);
+                        Ok(ControlFlow::Continue)
+                    }
+                    _ => Err(format!(
+                        "#[{}] produced a value but the inner statement has no binding",
+                        annotation
+                    )),
+                }
+            }
+
             Statement::FunctionDefinition { name, parameters, body, .. } => {
                 let func = AstFunction {
                     name: name.clone(),
@@ -270,7 +375,7 @@ impl AstInterpreter {
                 self.functions.insert(name.clone(), func);
                 Ok(ControlFlow::Continue)
             }
-            
+
             Statement::Write { value, .. } => {
                 let val = self.evaluate_expression(value)?;
                 if let Some(write_func) = self.native_functions.get("write") {
@@ -278,64 +383,62 @@ impl AstInterpreter {
                 }
                 Ok(ControlFlow::Continue)
             }
-            
+
             Statement::If { condition, then_branch, elif_branches, else_branch, .. } => {
                 let cond_val = self.evaluate_expression(condition)?;
                 if cond_val.is_truthy() {
                     return self.execute_block(then_branch);
                 }
-                
+
                 for (elif_cond, elif_body) in elif_branches {
                     let elif_val = self.evaluate_expression(elif_cond)?;
                     if elif_val.is_truthy() {
                         return self.execute_block(elif_body);
                     }
                 }
-                
+
                 if let Some(else_branch) = else_branch {
                     return self.execute_block(else_branch);
                 }
-                
+
                 Ok(ControlFlow::Continue)
             }
-            
+
             Statement::While { condition, body, counter_var, span: _ } => {
-                // If there's a counter variable, initialize it to 0
                 if let Some(var_name) = counter_var {
                     self.environment.set(var_name, Value::Int(0));
                 }
-                
+
                 let mut iterations = 0;
                 while iterations < self.max_iterations {
                     let cond_val = self.evaluate_expression(condition)?;
                     if !cond_val.is_truthy() {
                         break;
                     }
-                    
+
                     match self.execute_block(body)? {
                         ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
                         ControlFlow::Break => break,
                         ControlFlow::Continue => (),
                     }
-                    
+
                     iterations += 1;
                 }
-                
+
                 if iterations >= self.max_iterations {
                     return Err("Maximum loop iterations exceeded".to_string());
                 }
-                
+
                 Ok(ControlFlow::Continue)
             }
-            
+
             Statement::ImportStatement { from, items: _, .. } => {
-                // Handle imports - for now just register package functions
                 if from == "slattery" {
                     // Slattery UI imports are handled by the UI system
                 }
                 Ok(ControlFlow::Continue)
             }
-            
+
             Statement::Return { value, .. } => {
                 let val = match value {
                     Some(expr) => self.evaluate_expression(expr)?,
@@ -343,23 +446,21 @@ impl AstInterpreter {
                 };
                 Ok(ControlFlow::Return(val))
             }
-            
+
             Statement::Train { model, dataset, config, .. } => {
                 let model_val = self.evaluate_expression(model)?;
                 let dataset_val = self.evaluate_expression(dataset)?;
-                
-                // Extract model and dataset names
+
                 let model_name = match &model_val {
                     Value::String(s) => s.clone(),
                     _ => return Err("Model must be a string identifier".to_string()),
                 };
-                
+
                 let dataset_name = match &dataset_val {
                     Value::String(s) => s.clone(),
                     _ => return Err("Dataset must be a string identifier".to_string()),
                 };
-                
-                // Parse config values into string map for sLLM extension
+
                 let mut config_map = HashMap::new();
                 for (key, expr) in config {
                     let value = self.evaluate_expression(expr)?;
@@ -368,43 +469,40 @@ impl AstInterpreter {
                         Value::Float(n) => n.to_string(),
                         Value::String(s) => s,
                         Value::Bool(b) => b.to_string(),
-                        _ => return Err(format!("Config value for '{}' must be a primitive type", key)),
+                        _ => return Err(format!(
+                            "Config value for '{}' must be a primitive type", key
+                        )),
                     };
                     config_map.insert(key.clone(), value_str);
                 }
-                
-                // Try to use sLLM extension if available
+
                 if let Some(extensions) = self.extensions.borrow_mut().as_mut() {
                     for ext in extensions.get_extensions_mut() {
                         if ext.name() == "sllm" {
-                            // Use the extension's interface if available
-                            // The extension should handle the train_model call through its trait
-                            // For now, use the fallback implementation
                             break;
                         }
                     }
                 }
-                
-                // Fallback to basic training simulation
+
                 let epochs = config_map.get("epochs")
                     .and_then(|e| e.parse().ok())
                     .unwrap_or(3);
                 let learning_rate = config_map.get("learning_rate")
                     .and_then(|lr| lr.parse().ok())
                     .unwrap_or(3e-4);
-                
+
                 println!("[sLLM] Starting training...");
                 println!("  Model: {}", model_name);
                 println!("  Dataset: {}", dataset_name);
                 println!("  Epochs: {}", epochs);
                 println!("  Learning Rate: {}", learning_rate);
-                
+
                 for epoch in 0..epochs {
                     println!("  Epoch {}/{}", epoch + 1, epochs);
                 }
-                
+
                 println!("[sLLM] Training complete!");
-                
+
                 Ok(ControlFlow::Continue)
             }
         }
@@ -424,12 +522,11 @@ impl AstInterpreter {
     // ============ EXPRESSION EVALUATION ============
 
     pub fn evaluate_expression(&mut self, expression: &Expression) -> Result<Value, String> {
-        // First, handle extension expressions
+        // Extension expression handling
         if let Expression::Extension { name, type_name, .. } = expression {
             return Ok(Value::String(format!("Extension: {} ({})", name, type_name)));
         }
 
-        // Handle UI components
         if let Expression::UiComponent { component_type, .. } = expression {
             return Ok(Value::String(format!("UI Component: {:?}", component_type)));
         }
@@ -438,7 +535,7 @@ impl AstInterpreter {
             return Ok(Value::Null);
         }
 
-        // For other expressions, try extensions first
+        // Give extensions a chance to handle custom expressions.
         let has_extension_handler = {
             if let Some(extensions) = self.extensions.borrow().as_ref() {
                 let mut found = false;
@@ -461,36 +558,39 @@ impl AstInterpreter {
         // Core evaluation
         match expression {
             Expression::Literal(literal, _) => self.evaluate_literal(literal),
-            
+
             Expression::Variable(name, span) => {
                 self.environment.get(name)
                     .cloned()
-                    .ok_or_else(|| format!("Variable '{}' not found at line {}", name, span.line))
+                    .ok_or_else(|| format!(
+                        "Variable '{}' not found at line {}", name, span.line
+                    ))
             }
-            
+
             Expression::Binary { left, operator, right, .. } => {
                 let left_val = self.evaluate_expression(left)?;
                 let right_val = self.evaluate_expression(right)?;
                 self.evaluate_binary_operation(&left_val, operator, &right_val)
             }
-            
+
             Expression::FunctionCall { name, arguments, span } => {
-                // Check call stack depth
                 if self.call_stack.len() >= self.max_call_depth {
-                    return Err(format!("Maximum call depth exceeded: {}", self.max_call_depth));
+                    return Err(format!(
+                        "Maximum call depth exceeded: {}", self.max_call_depth
+                    ));
                 }
-                
+
                 let mut arg_values = Vec::new();
                 for arg in arguments {
                     arg_values.push(self.evaluate_expression(arg)?);
                 }
-                
+
                 self.call_stack.push(name.clone());
                 let result = self.call_function(name, arg_values, span);
                 self.call_stack.pop();
                 result
             }
-            
+
             Expression::Array(elements, _) => {
                 let mut values = Vec::new();
                 for elem in elements {
@@ -498,7 +598,7 @@ impl AstInterpreter {
                 }
                 Ok(Value::Array(values))
             }
-            
+
             Expression::Object(properties, _) => {
                 let mut map = HashMap::new();
                 for (key, value_expr) in properties {
@@ -507,14 +607,23 @@ impl AstInterpreter {
                 }
                 Ok(Value::Object(map))
             }
-            
+
             Expression::PropertyAccess { object, property, span } => {
                 let obj_val = self.evaluate_expression(object)?;
                 match obj_val {
                     Value::Object(map) => {
                         map.get(property)
                             .cloned()
-                            .ok_or_else(|| format!("Property '{}' not found at line {}", property, span.line))
+                            .ok_or_else(|| format!(
+                                "Property '{}' not found at line {}", property, span.line
+                            ))
+                    }
+                    Value::Struct { fields, .. } => {
+                        fields.get(property)
+                            .cloned()
+                            .ok_or_else(|| format!(
+                                "Field '{}' not found in struct at line {}", property, span.line
+                            ))
                     }
                     Value::String(s) if property == "len" => {
                         Ok(Value::Int(s.len() as i64))
@@ -522,49 +631,64 @@ impl AstInterpreter {
                     Value::Array(arr) if property == "len" => {
                         Ok(Value::Int(arr.len() as i64))
                     }
-                    _ => Err(format!("Cannot access property '{}' on non-object at line {}", property, span.line))
+                    _ => Err(format!(
+                        "Cannot access property '{}' on non-object at line {}",
+                        property, span.line
+                    )),
                 }
             }
-            
+
             Expression::MethodCall { object, method, arguments, span } => {
                 let obj_val = self.evaluate_expression(object)?;
-                
+
                 // Handle string methods
                 if let Value::String(s) = &obj_val {
                     match method.as_str() {
                         "len" => {
                             if !arguments.is_empty() {
-                                return Err(format!("len() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "len() takes no arguments at line {}", span.line
+                                ));
                             }
                             Ok(Value::Int(s.len() as i64))
                         }
                         "to_upper" => {
                             if !arguments.is_empty() {
-                                return Err(format!("to_upper() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "to_upper() takes no arguments at line {}", span.line
+                                ));
                             }
                             Ok(Value::String(s.to_uppercase()))
                         }
                         "to_lower" => {
                             if !arguments.is_empty() {
-                                return Err(format!("to_lower() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "to_lower() takes no arguments at line {}", span.line
+                                ));
                             }
                             Ok(Value::String(s.to_lowercase()))
                         }
                         "trim" => {
                             if !arguments.is_empty() {
-                                return Err(format!("trim() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "trim() takes no arguments at line {}", span.line
+                                ));
                             }
                             Ok(Value::String(s.trim().to_string()))
                         }
                         "contains" => {
                             if arguments.len() != 1 {
-                                return Err(format!("contains() expects 1 argument at line {}", span.line));
+                                return Err(format!(
+                                    "contains() expects 1 argument at line {}", span.line
+                                ));
                             }
                             let arg = self.evaluate_expression(&arguments[0])?;
                             let substr = arg.to_string();
                             Ok(Value::Bool(s.contains(&substr)))
                         }
-                        _ => Err(format!("Unknown method '{}' on string at line {}", method, span.line))
+                        _ => Err(format!(
+                            "Unknown method '{}' on string at line {}", method, span.line
+                        )),
                     }
                 }
                 // Handle array methods
@@ -572,13 +696,17 @@ impl AstInterpreter {
                     match method.as_str() {
                         "len" => {
                             if !arguments.is_empty() {
-                                return Err(format!("len() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "len() takes no arguments at line {}", span.line
+                                ));
                             }
                             Ok(Value::Int(arr.len() as i64))
                         }
                         "push" => {
                             if arguments.len() != 1 {
-                                return Err(format!("push() expects 1 argument at line {}", span.line));
+                                return Err(format!(
+                                    "push() expects 1 argument at line {}", span.line
+                                ));
                             }
                             let arg = self.evaluate_expression(&arguments[0])?;
                             let mut new_arr = arr.clone();
@@ -587,18 +715,19 @@ impl AstInterpreter {
                         }
                         "pop" => {
                             if !arguments.is_empty() {
-                                return Err(format!("pop() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "pop() takes no arguments at line {}", span.line
+                                ));
                             }
                             let mut new_arr = arr.clone();
-                            if let Some(_last) = new_arr.pop() {
-                                Ok(Value::Array(new_arr))
-                            } else {
-                                Ok(Value::Array(new_arr))
-                            }
+                            new_arr.pop();
+                            Ok(Value::Array(new_arr))
                         }
                         "get" => {
                             if arguments.len() != 1 {
-                                return Err(format!("get() expects 1 argument at line {}", span.line));
+                                return Err(format!(
+                                    "get() expects 1 argument at line {}", span.line
+                                ));
                             }
                             let arg = self.evaluate_expression(&arguments[0])?;
                             match arg {
@@ -607,13 +736,19 @@ impl AstInterpreter {
                                     if idx < arr.len() {
                                         Ok(arr[idx].clone())
                                     } else {
-                                        Err(format!("Index {} out of bounds at line {}", idx, span.line))
+                                        Err(format!(
+                                            "Index {} out of bounds at line {}", idx, span.line
+                                        ))
                                     }
                                 }
-                                _ => Err(format!("get() expects an integer index at line {}", span.line))
+                                _ => Err(format!(
+                                    "get() expects an integer index at line {}", span.line
+                                )),
                             }
                         }
-                        _ => Err(format!("Unknown method '{}' on array at line {}", method, span.line))
+                        _ => Err(format!(
+                            "Unknown method '{}' on array at line {}", method, span.line
+                        )),
                     }
                 }
                 // Handle object methods
@@ -621,39 +756,95 @@ impl AstInterpreter {
                     match method.as_str() {
                         "get" => {
                             if arguments.len() != 1 {
-                                return Err(format!("get() expects 1 argument at line {}", span.line));
+                                return Err(format!(
+                                    "get() expects 1 argument at line {}", span.line
+                                ));
                             }
                             let arg = self.evaluate_expression(&arguments[0])?;
                             let key = arg.to_string();
                             map.get(&key)
                                 .cloned()
-                                .ok_or_else(|| format!("Key '{}' not found at line {}", key, span.line))
+                                .ok_or_else(|| format!(
+                                    "Key '{}' not found at line {}", key, span.line
+                                ))
                         }
                         "keys" => {
                             if !arguments.is_empty() {
-                                return Err(format!("keys() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "keys() takes no arguments at line {}", span.line
+                                ));
                             }
-                            let keys: Vec<Value> = map.keys().map(|k| Value::String(k.clone())).collect();
+                            let keys: Vec<Value> = map.keys()
+                                .map(|k| Value::String(k.clone()))
+                                .collect();
                             Ok(Value::Array(keys))
                         }
                         "values" => {
                             if !arguments.is_empty() {
-                                return Err(format!("values() takes no arguments at line {}", span.line));
+                                return Err(format!(
+                                    "values() takes no arguments at line {}", span.line
+                                ));
                             }
                             let values: Vec<Value> = map.values().cloned().collect();
                             Ok(Value::Array(values))
                         }
-                        _ => Err(format!("Unknown method '{}' on object at line {}", method, span.line))
+                        _ => Err(format!(
+                            "Unknown method '{}' on object at line {}", method, span.line
+                        )),
                     }
                 }
-                // Handle sLLM extension methods
+                // Handle struct methods (mirror object methods)
+                else if let Value::Struct { fields, .. } = &obj_val {
+                    match method.as_str() {
+                        "get" => {
+                            if arguments.len() != 1 {
+                                return Err(format!(
+                                    "get() expects 1 argument at line {}", span.line
+                                ));
+                            }
+                            let arg = self.evaluate_expression(&arguments[0])?;
+                            let key = arg.to_string();
+                            fields.get(&key)
+                                .cloned()
+                                .ok_or_else(|| format!(
+                                    "Field '{}' not found at line {}", key, span.line
+                                ))
+                        }
+                        "keys" => {
+                            if !arguments.is_empty() {
+                                return Err(format!(
+                                    "keys() takes no arguments at line {}", span.line
+                                ));
+                            }
+                            let keys: Vec<Value> = fields.keys()
+                                .map(|k| Value::String(k.clone()))
+                                .collect();
+                            Ok(Value::Array(keys))
+                        }
+                        "values" => {
+                            if !arguments.is_empty() {
+                                return Err(format!(
+                                    "values() takes no arguments at line {}", span.line
+                                ));
+                            }
+                            let values: Vec<Value> = fields.values().cloned().collect();
+                            Ok(Value::Array(values))
+                        }
+                        _ => Err(format!(
+                            "Unknown method '{}' on struct at line {}", method, span.line
+                        )),
+                    }
+                }
+                // sLLM extension methods
                 else {
                     if let Expression::Extension { name, .. } = object.as_ref() {
                         if name == "sllm" {
                             match method.as_str() {
                                 "from_text_file" => {
                                     if arguments.len() != 1 {
-                                        return Err("from_text_file() expects 1 argument".to_string());
+                                        return Err(
+                                            "from_text_file() expects 1 argument".to_string()
+                                        );
                                     }
                                     let arg = self.evaluate_expression(&arguments[0])?;
                                     let path = arg.to_string();
@@ -661,27 +852,33 @@ impl AstInterpreter {
                                 }
                                 "from_directory" => {
                                     if arguments.len() != 1 {
-                                        return Err("from_directory() expects 1 argument".to_string());
+                                        return Err(
+                                            "from_directory() expects 1 argument".to_string()
+                                        );
                                     }
                                     let arg = self.evaluate_expression(&arguments[0])?;
                                     let path = arg.to_string();
                                     Ok(Value::String(format!("Dataset from directory: {}", path)))
                                 }
-                                _ => Err(format!("Unknown sLLM method: {}", method))
+                                _ => Err(format!("Unknown sLLM method: {}", method)),
                             }
                         } else {
-                            Err(format!("Method '{}' not supported on this type at line {}", method, span.line))
+                            Err(format!(
+                                "Method '{}' not supported on this type at line {}",
+                                method, span.line
+                            ))
                         }
                     } else {
-                        Err(format!("Method '{}' not supported on this type at line {}", method, span.line))
+                        Err(format!(
+                            "Method '{}' not supported on this type at line {}",
+                            method, span.line
+                        ))
                     }
                 }
             }
-            
-            Expression::Import { from: _, items: _, .. } => {
-                Ok(Value::Null)
-            }
-            
+
+            Expression::Import { from: _, items: _, .. } => Ok(Value::Null),
+
             Expression::Make { name, properties, children, .. } => {
                 let mut props = HashMap::new();
                 for (key, expr) in properties {
@@ -692,20 +889,22 @@ impl AstInterpreter {
                 for child in children {
                     child_vals.push(self.evaluate_expression(child)?);
                 }
-                Ok(Value::String(format!("Make<{}> with {} props and {} children", name, props.len(), child_vals.len())))
+                Ok(Value::String(format!(
+                    "Make<{}> with {} props and {} children",
+                    name, props.len(), child_vals.len()
+                )))
             }
-            
+
             Expression::Render { target, .. } => {
                 let target_val = self.evaluate_expression(target)?;
                 Ok(Value::String(format!("Render<{}>", target_val.to_string())))
             }
-            
+
             Expression::UiComponent { .. } => {
                 Ok(Value::String("UI Component".to_string()))
             }
-            Expression::UiRender { .. } => {
-                Ok(Value::Null)
-            }
+            Expression::UiRender { .. } => Ok(Value::Null),
+
             Expression::Extension { name, type_name, .. } => {
                 Ok(Value::String(format!("Extension: {} ({})", name, type_name)))
             }
@@ -881,20 +1080,6 @@ impl AstInterpreter {
         }
 
         Err(format!("Function '{}' not found at line {}", name, span.line))
-    }
-
-    pub fn run(&mut self, tokens: &[crate::lexer::Token]) -> Result<(), String> {
-        let source = tokens.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join(" ");
-        let mut parser = crate::parser::Parser::new(
-            tokens.to_vec(), 
-            source, 
-            ExtensionRegistry::new()
-        );
-        let program = parser.parse()
-            .map_err(|e| format!("Parse error: {}", e))?;
-        
-        self.interpret(&program)?;
-        Ok(())
     }
 }
 

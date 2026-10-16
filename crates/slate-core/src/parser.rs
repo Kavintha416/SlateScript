@@ -25,65 +25,87 @@ impl Parser {
             extensions,
         }
     }
-    
+
+    fn resolved_peek(&self) -> Token {
+        self.resolved_peek_at(0)
+    }
+
+    fn resolved_peek_at(&self, offset: usize) -> Token {
+        let idx = self.current + offset;
+        if idx >= self.tokens.len() {
+            return Token::EOF;
+        }
+        let tok = &self.tokens[idx];
+        if let Token::Identifier(word) = tok {
+            if let Some(ext_name) = self.extensions.lookup_keyword(word) {
+                return Token::Extension {
+                    name: ext_name.to_string(),
+                    keyword: word.clone(),
+                };
+            }
+        }
+        tok.clone()
+    }
+
+    #[allow(dead_code)]
+    fn advance_resolved(&mut self) -> Token {
+        let tok = self.resolved_peek();
+        self.current += 1;
+        tok
+    }
+
     pub fn take_extensions(&mut self) -> ExtensionRegistry {
         std::mem::take(&mut self.extensions)
     }
-    
+
     pub fn parse(&mut self) -> Result<Program, SlateError> {
         let mut statements = Vec::new();
-        
+
         while !self.is_at_end() {
-            if let Some(stmt) = self.try_parse_extension()? {
-                statements.push(stmt);
-                continue;
-            }
-            
-            match self.peek() {
-                Token::Import => {
-                    statements.push(self.parse_import_statement()?);
+            // 1. Extension statements get first refusal.
+            match self.extensions.try_parse_statement(&self.tokens, self.current) {
+                Ok(Some((stmt, new_pos))) => {
+                    self.current = new_pos;
+                    statements.push(stmt);
+                    continue;
                 }
-                Token::Write => {
-                    statements.push(self.parse_write_statement()?);
-                }
-                Token::If => {
-                    statements.push(self.parse_if_statement()?);
-                }
-                Token::Loop => {
-                    statements.push(self.parse_loop_statement()?);
-                }
-                Token::Func => {
-                    statements.push(self.parse_function_definition()?);
-                }
-                Token::Make => {
-                    statements.push(self.parse_make_statement()?);
-                }
-                Token::Identifier(_) => {
-                    if self.peek_next_assign() {
-                        statements.push(self.parse_assignment_statement()?);
-                    } else {
-                        statements.push(Statement::Expression(self.parse_expression()?));
-                    }
-                }
-                Token::EOF => break,
-                _ => {
-                    let token_str = format!("{:?}", self.peek());
-                    return Err(ErrorBuilder::unknown_term(
-                        &token_str,
+                Ok(None) => {}
+                Err(msg) => {
+                    return Err(ErrorBuilder::generic(
+                        ErrorCode::UnknownTerm,
+                        &msg,
                         self.current_line(),
                         self.current_column(),
                     )
-                    .with_source(self.get_current_line())
-                    .with_suggestion(&format!(
-                        "Unexpected token '{}'. Check your syntax.",
-                        token_str
-                    )));
+                    .with_source(self.get_current_line()));
                 }
             }
+
+            // 2. Extension expressions are wrapped as Expression statements.
+            match self.extensions.try_parse_expression(&self.tokens, self.current) {
+                Ok(Some((expr, new_pos))) => {
+                    self.current = new_pos;
+                    statements.push(Statement::Expression(expr));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(msg) => {
+                    return Err(ErrorBuilder::generic(
+                        ErrorCode::UnknownTerm,
+                        &msg,
+                        self.current_line(),
+                        self.current_column(),
+                    )
+                    .with_source(self.get_current_line()));
+                }
+            }
+
+            // 3. Fall through to core statement parsing.
+            statements.push(self.parse_core_statement()?);
         }
-        
+
         let mut program = Program::new(statements);
-        
+
         for ext in self.extensions.get_extensions_mut_post_process() {
             if let Err(e) = ext.post_process_ast(&mut program) {
                 return Err(ErrorBuilder::generic(
@@ -94,40 +116,21 @@ impl Parser {
                 ));
             }
         }
-        
+
         Ok(program)
     }
-    
-    fn try_parse_extension(&mut self) -> Result<Option<Statement>, SlateError> {
-        for ext in self.extensions.get_extensions() {
-            if let Some((expr, new_pos)) = ext.parse_extension(&self.tokens, self.current) {
-                self.current = new_pos;
-                return Ok(Some(Statement::Expression(expr)));
-            }
-        }
-        Ok(None)
-    }
-    
-    fn try_parse_extension_expression(&mut self) -> Result<Option<Expression>, SlateError> {
-        for ext in self.extensions.get_extensions() {
-            if let Some((expr, new_pos)) = ext.parse_extension(&self.tokens, self.current) {
-                self.current = new_pos;
-                return Ok(Some(expr));
-            }
-        }
-        Ok(None)
-    }
-    
-    fn parse_statement(&mut self) -> Result<Statement, SlateError> {
+
+    fn parse_core_statement(&mut self) -> Result<Statement, SlateError> {
         match self.peek() {
+            Token::Annotation { .. } => self.parse_annotated_statement(),
             Token::Import => self.parse_import_statement(),
-            Token::Write => self.parse_write_statement(),
-            Token::If => self.parse_if_statement(),
-            Token::Loop => self.parse_loop_statement(),
-            Token::Func => self.parse_function_definition(),
-            Token::Make => self.parse_make_statement(),
+            Token::Write  => self.parse_write_statement(),
+            Token::If     => self.parse_if_statement(),
+            Token::Loop   => self.parse_loop_statement(),
+            Token::Func   => self.parse_function_definition(),
+            Token::Make   => self.parse_make_statement(),
             Token::Identifier(_) => {
-                if self.peek_next_assign() {
+                if self.peek_next_is_assignable() {
                     self.parse_assignment_statement()
                 } else {
                     Ok(Statement::Expression(self.parse_expression()?))
@@ -136,10 +139,56 @@ impl Parser {
             _ => Ok(Statement::Expression(self.parse_expression()?)),
         }
     }
-    
+
+    /// Parse `#[name]` followed by a statement.
+    ///
+    /// Only `make` and assignment statements are accepted after an
+    /// annotation. Other statements will be rejected by the annotation's
+    /// `evaluate` method at runtime.
+    fn parse_annotated_statement(&mut self) -> Result<Statement, SlateError> {
+        let span_start = self.current;
+
+        let annotation = match self.peek() {
+            Token::Annotation { name } => name.clone(),
+            _ => unreachable!("parse_annotated_statement called without Annotation token"),
+        };
+        self.advance();
+
+        // Parse the following statement. Only make/assignment are accepted.
+        let inner = match self.peek() {
+            Token::Make => self.parse_make_statement()?,
+            Token::Identifier(_) if self.peek_next_is_assignable() => {
+                self.parse_assignment_statement()?
+            }
+            _ => {
+                return Err(ErrorBuilder::generic(
+                    ErrorCode::UnknownTerm,
+                    &format!(
+                        "Annotation '#[{}]' must precede a `make` or assignment statement",
+                        annotation
+                    ),
+                    self.current_line(),
+                    self.current_column(),
+                )
+                .with_source(self.get_current_line())
+                .with_suggestion(&format!(
+                    "#[{}]\nmake my_value {{ field: value }}",
+                    annotation
+                )));
+            }
+        };
+
+        let span = Span::new(span_start, self.current, 0, 0);
+        Ok(Statement::Annotated {
+            annotation,
+            inner: Box::new(inner),
+            span,
+        })
+    }
+
     fn parse_make_statement(&mut self) -> Result<Statement, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
-        
+
         if !matches!(self.peek(), Token::Make) {
             let token_str = format!("{:?}", self.peek());
             let error = if token_str.contains("var") {
@@ -151,7 +200,7 @@ impl Parser {
                 ErrorBuilder::unknown_term_with_suggestion(
                     "let",
                     "Use 'make' instead of 'let' for variable declarations:\n\
-                     make x = 5",
+                    make x = 5",
                     self.current_line(),
                     self.current_column(),
                 )
@@ -159,7 +208,7 @@ impl Parser {
                 ErrorBuilder::unknown_term_with_suggestion(
                     "const",
                     "Use 'make' for all variable declarations:\n\
-                     make x = 5",
+                    make x = 5",
                     self.current_line(),
                     self.current_column(),
                 )
@@ -174,7 +223,7 @@ impl Parser {
             return Err(error);
         }
         self.advance();
-        
+
         let name = self.consume_identifier();
         if name.is_empty() {
             return Err(ErrorBuilder::generic(
@@ -186,7 +235,28 @@ impl Parser {
             .with_source(self.get_current_line())
             .with_suggestion("make <variable_name> = <value>"));
         }
-        
+
+        // ---- Form A: `make name { ... }` (no '=') ----
+        //
+        // The brace block is parsed as an object literal and used as the
+        // value. This is the form used with `#[struct]`:
+        //
+        //     #[struct]
+        //     make point {
+        //         x: 3,
+        //         y: 4,
+        //     }
+        //
+        if matches!(self.peek(), Token::LeftBrace) {
+            let value = self.parse_object_literal()?;
+            return Ok(Statement::Assignment {
+                name,
+                value,
+                span,
+            });
+        }
+
+        // ---- Form B: `make name = value` ----
         if !matches!(self.peek(), Token::Equal) {
             return Err(ErrorBuilder::generic(
                 ErrorCode::BracketError,
@@ -198,20 +268,40 @@ impl Parser {
             .with_suggestion(&format!("make {} = <value>", name)));
         }
         self.advance();
-        
+
         let value = self.parse_expression()?;
-        
+
         Ok(Statement::Assignment {
             name,
             value,
             span,
         })
     }
-    
+
+    fn peek_next_is_assignable(&self) -> bool {
+        // True if the current token is an identifier that eventually
+        // leads to an `=`. Handles both `name = ` and `name.field = `.
+        if self.current >= self.tokens.len() {
+            return false;
+        }
+        // Must start with an identifier.
+        if !matches!(self.tokens[self.current], Token::Identifier(_)) {
+            return false;
+        }
+        // Scan forward, allowing `.identifier` pairs, until we hit
+        // something that isn't a dot.
+        let mut i = self.current + 1;
+        while i + 1 < self.tokens.len() && matches!(self.tokens[i], Token::Dot) {
+            i += 2; // skip Dot and the identifier
+        }
+        // Now check if the next token is `=`.
+        i < self.tokens.len() && matches!(self.tokens[i], Token::Equal)
+    }
+
     fn parse_write_statement(&mut self) -> Result<Statement, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         self.advance();
-        
+
         if !matches!(self.peek(), Token::LeftParen) {
             return Err(ErrorBuilder::bracket_error(
                 self.current_line(),
@@ -221,12 +311,12 @@ impl Parser {
             .with_suggestion("write(\"hello\")"));
         }
         self.advance();
-        
+
         let mut args = Vec::new();
         if !matches!(self.peek(), Token::RightParen) {
             args = self.parse_expression_list_paren()?;
         }
-        
+
         if !matches!(self.peek(), Token::RightParen) {
             return Err(ErrorBuilder::bracket_error(
                 self.current_line(),
@@ -236,16 +326,16 @@ impl Parser {
             .with_suggestion("write(\"hello\")"));
         }
         self.advance();
-        
+
         let expr = Expression::FunctionCall {
             name: "write".to_string(),
             arguments: args,
             span,
         };
-        
+
         Ok(Statement::Expression(expr))
     }
-    
+
     fn parse_condition(&mut self) -> Result<Expression, SlateError> {
         if !matches!(self.peek(), Token::LessThan) {
             return Err(ErrorBuilder::bracket_error(
@@ -255,12 +345,12 @@ impl Parser {
             .with_source(self.get_current_line())
             .with_suggestion("if <condition> { ... }"));
         }
-        
+
         let mut depth = 1;
         let mut expr_tokens = Vec::new();
-        
+
         self.advance();
-        
+
         while !self.is_at_end() && depth > 0 {
             match self.peek() {
                 Token::LessThan => {
@@ -275,15 +365,12 @@ impl Parser {
                     }
                     expr_tokens.push(self.advance());
                 }
-                Token::LessEqual | Token::GreaterEqual | Token::EqualEqual | Token::NotEqual => {
-                    expr_tokens.push(self.advance());
-                }
                 _ => {
                     expr_tokens.push(self.advance());
                 }
             }
         }
-        
+
         if depth > 0 {
             return Err(ErrorBuilder::bracket_error(
                 self.current_line(),
@@ -292,13 +379,13 @@ impl Parser {
             .with_source(self.get_current_line())
             .with_suggestion("Missing closing '>' in condition"));
         }
-        
+
         let mut temp_parser = Parser::new(
             expr_tokens,
             self.source.clone(),
             self.extensions.clone(),
         );
-        
+
         temp_parser.parse_expression()
             .map_err(|e| ErrorBuilder::generic(
                 ErrorCode::BracketError,
@@ -308,14 +395,14 @@ impl Parser {
             )
             .with_source(self.get_current_line()))
     }
-    
+
     fn parse_if_statement(&mut self) -> Result<Statement, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         self.advance();
-        
+
         let condition = self.parse_condition()?;
         let then_branch = self.parse_block()?;
-        
+
         let mut elif_branches = Vec::new();
         while matches!(self.peek(), Token::Elif) {
             self.advance();
@@ -323,14 +410,14 @@ impl Parser {
             let elif_body = self.parse_block()?;
             elif_branches.push((elif_condition, elif_body));
         }
-        
+
         let else_branch = if matches!(self.peek(), Token::Else) {
             self.advance();
             Some(self.parse_block()?)
         } else {
             None
         };
-        
+
         Ok(Statement::If {
             condition,
             then_branch,
@@ -339,10 +426,10 @@ impl Parser {
             span,
         })
     }
-    
+
     fn parse_block(&mut self) -> Result<Vec<Statement>, SlateError> {
-        let span = Span::new(self.current, self.current, 0, 0);
-        
+        let _span = Span::new(self.current, self.current, 0, 0);
+
         if !matches!(self.peek(), Token::LeftBrace) {
             return Err(ErrorBuilder::missing_open_brace(
                 "block",
@@ -352,12 +439,49 @@ impl Parser {
             .with_source(self.get_current_line()));
         }
         self.advance();
-        
+
         let mut statements = Vec::new();
         while !self.is_at_end() && !matches!(self.peek(), Token::RightBrace) {
-            statements.push(self.parse_statement()?);
+            // Extensions get first refusal inside blocks too.
+            match self.extensions.try_parse_statement(&self.tokens, self.current) {
+                Ok(Some((stmt, new_pos))) => {
+                    self.current = new_pos;
+                    statements.push(stmt);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(msg) => {
+                    return Err(ErrorBuilder::generic(
+                        ErrorCode::UnknownTerm,
+                        &msg,
+                        self.current_line(),
+                        self.current_column(),
+                    )
+                    .with_source(self.get_current_line()));
+                }
+            }
+
+            match self.extensions.try_parse_expression(&self.tokens, self.current) {
+                Ok(Some((expr, new_pos))) => {
+                    self.current = new_pos;
+                    statements.push(Statement::Expression(expr));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(msg) => {
+                    return Err(ErrorBuilder::generic(
+                        ErrorCode::UnknownTerm,
+                        &msg,
+                        self.current_line(),
+                        self.current_column(),
+                    )
+                    .with_source(self.get_current_line()));
+                }
+            }
+
+            statements.push(self.parse_core_statement()?);
         }
-        
+
         if !matches!(self.peek(), Token::RightBrace) {
             return Err(ErrorBuilder::missing_close_brace(
                 "block",
@@ -367,13 +491,13 @@ impl Parser {
             .with_source(self.get_current_line()));
         }
         self.advance();
-        
+
         Ok(statements)
     }
-    
+
     fn parse_loop_statement(&mut self) -> Result<Statement, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
-        
+
         if !matches!(self.peek(), Token::Loop) {
             return Err(ErrorBuilder::generic(
                 ErrorCode::UnknownTerm,
@@ -385,7 +509,7 @@ impl Parser {
             .with_suggestion("loop <count> { ... }"));
         }
         self.advance();
-        
+
         let count = match self.peek() {
             Token::Number(n) => {
                 let value = *n;
@@ -452,7 +576,7 @@ impl Parser {
                 .with_suggestion("loop <count> { ... }"));
             }
         };
-        
+
         let counter_var = if matches!(self.peek(), Token::With) {
             self.advance();
             match self.peek() {
@@ -478,7 +602,7 @@ impl Parser {
                             self.current_column() - 1,
                         )
                         .with_source(self.get_current_line())
-                        .with_suggestion(&format!("Use a different variable name")));
+                        .with_suggestion("Use a different variable name"));
                     }
                     Some(name)
                 }
@@ -506,7 +630,7 @@ impl Parser {
         } else {
             Some("i".to_string())
         };
-        
+
         if !matches!(self.peek(), Token::LeftBrace) {
             return Err(ErrorBuilder::missing_open_brace(
                 "loop",
@@ -516,18 +640,18 @@ impl Parser {
             .with_source(self.get_current_line())
             .with_suggestion(&format!("loop {} {{ ... }}", count)));
         }
-        
+
         let body = self.parse_block()?;
-        
+
         let var_name = counter_var.unwrap_or_else(|| "i".to_string());
-        
+
         let condition = Expression::Binary {
             left: Box::new(Expression::Variable(var_name.clone(), span)),
             operator: BinaryOperator::LessThan,
             right: Box::new(Expression::Literal(LiteralValue::Number(count as f64), span)),
             span,
         };
-        
+
         let increment = Statement::Assignment {
             name: var_name.clone(),
             value: Expression::Binary {
@@ -538,10 +662,10 @@ impl Parser {
             },
             span,
         };
-        
+
         let mut full_body = body;
         full_body.push(increment);
-        
+
         Ok(Statement::While {
             condition,
             body: full_body,
@@ -549,11 +673,11 @@ impl Parser {
             span,
         })
     }
-    
+
     fn parse_import_statement(&mut self) -> Result<Statement, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         self.advance();
-        
+
         if !matches!(self.peek(), Token::From) {
             return Err(ErrorBuilder::generic(
                 ErrorCode::UnknownTerm,
@@ -565,14 +689,14 @@ impl Parser {
             .with_suggestion("import from \"package\" { ... }"));
         }
         self.advance();
-        
+
         let package_name = match self.peek() {
             Token::String(s) => {
                 let name = s.clone();
                 self.advance();
                 name
             }
-            Token::Identifier(s) if s.to_lowercase() == "slattery" => {
+            Token::Identifier(s) => {
                 let name = s.clone();
                 self.advance();
                 name
@@ -588,84 +712,29 @@ impl Parser {
                 .with_suggestion("import from \"package\" { ... }"));
             }
         };
-        
+
         if matches!(self.peek(), Token::LeftBrace) {
             self.advance();
-            
+
             let mut items = Vec::new();
-            
+
             while !self.is_at_end() && !matches!(self.peek(), Token::RightBrace) {
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                     continue;
                 }
-                
-                let item = match self.peek() {
-                    Token::Identifier(name) => {
-                        let name = name.clone();
-                        self.advance();
-                        name
-                    }
-                    Token::Window => {
-                        self.advance();
-                        "Window".to_string()
-                    }
-                    Token::Column => {
-                        self.advance();
-                        "Column".to_string()
-                    }
-                    Token::Row => {
-                        self.advance();
-                        "Row".to_string()
-                    }
-                    Token::Text => {
-                        self.advance();
-                        "Text".to_string()
-                    }
-                    Token::Button => {
-                        self.advance();
-                        "Button".to_string()
-                    }
-                    Token::Input => {
-                        self.advance();
-                        "Input".to_string()
-                    }
-                    Token::Identity => {
-                        self.advance();
-                        "Identity".to_string()
-                    }
-                    Token::Rewrite => {
-                        self.advance();
-                        "Rewrite".to_string()
-                    }
-                    Token::OnTap => {
-                        self.advance();
-                        "on_tap".to_string()
-                    }
-                    Token::OnClick => {
-                        self.advance();
-                        "on_click".to_string()
-                    }
-                    Token::OnChange => {
-                        self.advance();
-                        "on_change".to_string()
-                    }
-                    Token::OnInput => {
-                        self.advance();
-                        "on_input".to_string()
-                    }
-                    Token::Render => {
-                        self.advance();
-                        "render".to_string()
-                    }
-                    _ => {
-                        self.advance();
-                        continue;
-                    }
-                };
-                items.push(item);
+
+                // Any identifier is a valid import item now.
+                // Extension keywords like `Window` come through as identifiers.
+                if let Token::Identifier(name) = self.peek() {
+                    let name = name.clone();
+                    self.advance();
+                    items.push(name);
+                } else {
+                    self.advance();
+                }
             }
-            
+
             if !matches!(self.peek(), Token::RightBrace) {
                 return Err(ErrorBuilder::generic(
                     ErrorCode::BracketError,
@@ -676,7 +745,7 @@ impl Parser {
                 .with_source(self.get_current_line()));
             }
             self.advance();
-            
+
             Ok(Statement::ImportStatement {
                 from: package_name,
                 items,
@@ -690,7 +759,7 @@ impl Parser {
             })
         }
     }
-    
+
     fn parse_assignment_statement(&mut self) -> Result<Statement, SlateError> {
         let name = self.consume_identifier();
         if name.is_empty() {
@@ -703,9 +772,54 @@ impl Parser {
             .with_source(self.get_current_line())
             .with_suggestion("make <variable_name> = <value>"));
         }
-        
+
         let span = Span::new(self.current, self.current, 0, 0);
-        
+
+        // If we see `.`, this is a property assignment: `name.field = ...`
+        // or `name.field.field2 = ...`
+        if matches!(self.peek(), Token::Dot) {
+            let mut target = Expression::Variable(name, span);
+            while matches!(self.peek(), Token::Dot) {
+                self.advance();
+                let prop = match self.peek() {
+                    Token::Identifier(p) => {
+                        let s = p.clone();
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        return Err(ErrorBuilder::generic(
+                            ErrorCode::UnknownTerm,
+                            "Expected field name after '.'",
+                            self.current_line(),
+                            self.current_column(),
+                        )
+                        .with_source(self.get_current_line()));
+                    }
+                };
+                target = Expression::PropertyAccess {
+                    object: Box::new(target),
+                    property: prop,
+                    span,
+                };
+            }
+
+            if !matches!(self.peek(), Token::Equal) {
+                return Err(ErrorBuilder::generic(
+                    ErrorCode::BracketError,
+                    "Expected '=' after assignment target",
+                    self.current_line(),
+                    self.current_column(),
+                )
+                .with_source(self.get_current_line()));
+            }
+            self.advance();
+
+            let value = self.parse_expression()?;
+            return Ok(Statement::PropertyAssignment { target, value, span });
+        }
+
+        // Simple `name = value`
         if !matches!(self.peek(), Token::Equal) {
             return Err(ErrorBuilder::generic(
                 ErrorCode::BracketError,
@@ -717,20 +831,16 @@ impl Parser {
             .with_suggestion(&format!("{} = <value>", name)));
         }
         self.advance();
-        
+
         let value = self.parse_expression()?;
-        
-        Ok(Statement::Assignment {
-            name,
-            value,
-            span,
-        })
+
+        Ok(Statement::Assignment { name, value, span })
     }
-    
+
     fn parse_function_definition(&mut self) -> Result<Statement, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         self.advance();
-        
+
         let name = self.consume_identifier();
         if name.is_empty() {
             return Err(ErrorBuilder::unknown_term(
@@ -741,7 +851,7 @@ impl Parser {
             .with_source(self.get_current_line())
             .with_suggestion("func add<a,b> { ... }"));
         }
-        
+
         if !matches!(self.peek(), Token::LessThan) {
             return Err(ErrorBuilder::missing_angle_open(
                 &name,
@@ -752,12 +862,12 @@ impl Parser {
             .with_suggestion(&format!("func {}<...> {{ ... }}", name)));
         }
         self.advance();
-        
+
         let mut parameters = Vec::new();
         if !matches!(self.peek(), Token::GreaterThan) {
             parameters = self.parse_identifier_list()?;
         }
-        
+
         if !matches!(self.peek(), Token::GreaterThan) {
             return Err(ErrorBuilder::missing_angle_close(
                 &name,
@@ -768,7 +878,7 @@ impl Parser {
             .with_suggestion(&format!("func {}<{}> {{ ... }}", name, parameters.join(", "))));
         }
         self.advance();
-        
+
         if !matches!(self.peek(), Token::LeftBrace) {
             return Err(ErrorBuilder::missing_open_brace(
                 &name,
@@ -782,9 +892,9 @@ impl Parser {
                 parameters.join(", ")
             )));
         }
-        
+
         let body = self.parse_block()?;
-        
+
         Ok(Statement::FunctionDefinition {
             name,
             parameters,
@@ -792,35 +902,43 @@ impl Parser {
             span,
         })
     }
-    
+
     fn parse_expression(&mut self) -> Result<Expression, SlateError> {
-        if let Some(expr) = self.try_parse_angle_component()? {
-            return Ok(expr);
+        match self.extensions.try_parse_expression(&self.tokens, self.current) {
+            Ok(Some((expr, new_pos))) => {
+                self.current = new_pos;
+                return Ok(expr);
+            }
+            Ok(None) => {}
+            Err(msg) => {
+                return Err(ErrorBuilder::generic(
+                    ErrorCode::UnknownTerm,
+                    &msg,
+                    self.current_line(),
+                    self.current_column(),
+                )
+                .with_source(self.get_current_line()));
+            }
         }
-        
-        if let Some(expr) = self.try_parse_extension_expression()? {
-            return Ok(expr);
-        }
-        
         self.parse_binary_expression()
     }
-    
+
     fn parse_binary_expression(&mut self) -> Result<Expression, SlateError> {
         self.parse_expression_with_precedence(0)
     }
-    
+
     fn parse_expression_with_precedence(&mut self, min_precedence: u8) -> Result<Expression, SlateError> {
         let mut left = self.parse_primary_expression()?;
-        
+
         while let Some((op, precedence)) = self.peek_binary_operator() {
             if precedence < min_precedence {
                 break;
             }
-            
+
             self.advance();
             let right = self.parse_expression_with_precedence(precedence + 1)?;
             let span = left.span().merge(&right.span());
-            
+
             left = Expression::Binary {
                 left: Box::new(left),
                 operator: op,
@@ -828,10 +946,10 @@ impl Parser {
                 span,
             };
         }
-        
+
         Ok(left)
     }
-    
+
     fn peek_binary_operator(&mut self) -> Option<(BinaryOperator, u8)> {
         let precedence = match self.peek() {
             Token::Multiply | Token::Divide => 3,
@@ -841,7 +959,7 @@ impl Parser {
             Token::GreaterThan | Token::GreaterEqual => 1,
             _ => return None,
         };
-        
+
         let op = match self.peek() {
             Token::Plus => BinaryOperator::Add,
             Token::Minus => BinaryOperator::Subtract,
@@ -855,10 +973,10 @@ impl Parser {
             Token::GreaterEqual => BinaryOperator::GreaterThanOrEqual,
             _ => return None,
         };
-        
+
         Some((op, precedence))
     }
-    
+
     fn parse_primary_expression(&mut self) -> Result<Expression, SlateError> {
         match self.peek() {
             Token::Number(_) => self.parse_number_literal(),
@@ -873,11 +991,11 @@ impl Parser {
                 } else {
                     let name = self.consume_identifier();
                     let span = Span::new(self.current, self.current, 0, 0);
-                    
+
                     if matches!(self.peek(), Token::Dot) {
                         return self.parse_property_access(Expression::Variable(name, span));
                     }
-                    
+
                     Ok(Expression::Variable(name, span))
                 }
             }
@@ -895,28 +1013,8 @@ impl Parser {
                 self.advance();
                 Ok(expr)
             }
-            Token::LeftBracket => {
-                self.parse_array_literal()
-            }
-            Token::LeftBrace => {
-                self.parse_object_literal()
-            }
-            Token::Window | Token::Column | Token::Row | Token::Text |
-            Token::Button | Token::Input => {
-                self.parse_ui_component()
-            }
-            Token::Parent | Token::Child => {
-                let token = self.advance();
-                let name = format!("{:?}", token);
-                let span = Span::new(self.current, self.current, 0, 0);
-                Ok(Expression::Variable(name, span))
-            }
-            Token::OnTap | Token::OnClick | Token::OnChange | Token::OnInput => {
-                let token = self.advance();
-                let name = format!("{:?}", token);
-                let span = Span::new(self.current, self.current, 0, 0);
-                Ok(Expression::Variable(name, span))
-            }
+            Token::LeftBracket => self.parse_array_literal(),
+            Token::LeftBrace => self.parse_object_literal(),
             Token::LessThan | Token::GreaterThan | Token::Plus | Token::Minus |
             Token::Multiply | Token::Divide | Token::EqualEqual | Token::NotEqual |
             Token::LessEqual | Token::GreaterEqual => {
@@ -938,298 +1036,11 @@ impl Parser {
             }
         }
     }
-    
-    fn parse_ui_component(&mut self) -> Result<Expression, SlateError> {
-        let component_type = match self.peek() {
-            Token::Window => UiComponentType::Window,
-            Token::Column => UiComponentType::Column,
-            Token::Row => UiComponentType::Row,
-            Token::Text => UiComponentType::Text,
-            Token::Button => UiComponentType::Button,
-            Token::Input => UiComponentType::Input,
-            _ => {
-                return Err(ErrorBuilder::generic(
-                    ErrorCode::UnknownTerm,
-                    &format!("Expected UI component type, found '{:?}'", self.peek()),
-                    self.current_line(),
-                    self.current_column(),
-                )
-                .with_source(self.get_current_line()));
-            }
-        };
-        
-        self.advance();
-        let span = Span::new(self.current, self.current, 0, 0);
-        
-        if matches!(self.peek(), Token::LeftBrace) {
-            self.advance();
-            
-            let mut properties = HashMap::new();
-            let mut children = Vec::new();
-            let mut events = HashMap::new();
-            
-            while !self.is_at_end() && !matches!(self.peek(), Token::RightBrace) {
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    continue;
-                }
-                
-                let prop_name = match self.peek() {
-                    Token::Identifier(name) => {
-                        let n = name.clone();
-                        self.advance();
-                        n
-                    }
-                    Token::Text => {
-                        self.advance();
-                        "value".to_string()
-                    }
-                    Token::Button => {
-                        self.advance();
-                        "label".to_string()
-                    }
-                    Token::OnTap => {
-                        self.advance();
-                        "on_tap".to_string()
-                    }
-                    Token::OnClick => {
-                        self.advance();
-                        "on_click".to_string()
-                    }
-                    Token::OnChange => {
-                        self.advance();
-                        "on_change".to_string()
-                    }
-                    Token::OnInput => {
-                        self.advance();
-                        "on_input".to_string()
-                    }
-                    Token::Identity => {
-                        self.advance();
-                        "Identity".to_string()
-                    }
-                    Token::Parent => {
-                        self.advance();
-                        "Parent".to_string()
-                    }
-                    Token::Child => {
-                        self.advance();
-                        "Child".to_string()
-                    }
-                    Token::Render => {
-                        self.advance();
-                        "Render".to_string()
-                    }
-                    _ => {
-                        self.advance();
-                        continue;
-                    }
-                };
-                
-                if matches!(self.peek(), Token::Colon) {
-                    self.advance();
-                    
-                    let value = self.parse_expression()?;
-                    
-                    if prop_name == "on_tap" || prop_name == "on_click" ||
-                       prop_name == "on_change" || prop_name == "on_input" {
-                        if let Expression::Variable(var_name, _) = &value {
-                            events.insert(prop_name, var_name.clone());
-                        }
-                    } else if prop_name == "Child" || prop_name == "Parent" {
-                        children.push(value);
-                    } else if prop_name == "Identity" {
-                        if let Expression::Literal(LiteralValue::String(id), _) = &value {
-                            properties.insert("Identity".to_string(), Expression::Literal(LiteralValue::String(id.clone()), span));
-                        } else if let Expression::Variable(var_name, _) = &value {
-                            properties.insert("Identity".to_string(), Expression::Literal(LiteralValue::String(var_name.clone()), span));
-                        }
-                    } else {
-                        properties.insert(prop_name, value);
-                    }
-                } else if prop_name == "Identity" {
-                    if let Token::Identifier(id) = self.peek() {
-                        let id = id.clone();
-                        self.advance();
-                        properties.insert("Identity".to_string(), Expression::Literal(LiteralValue::String(id), span));
-                    }
-                }
-                
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                }
-            }
-            
-            if matches!(self.peek(), Token::RightBrace) {
-                self.advance();
-            } else {
-                return Err(ErrorBuilder::missing_close_brace(
-                    "UI component",
-                    self.current_line(),
-                    self.current_column(),
-                )
-                .with_source(self.get_current_line()));
-            }
-            
-            Ok(Expression::UiComponent {
-                component_type,
-                identity: None,
-                properties,
-                children,
-                events,
-                span,
-            })
-        } else {
-            Ok(Expression::Variable(component_type.as_str().to_string(), span))
-        }
-    }
-    
-    fn try_parse_angle_component(&mut self) -> Result<Option<Expression>, SlateError> {
-        if !matches!(self.peek(), Token::LessThan) {
-            return Ok(None);
-        }
-        
-        let saved_pos = self.current;
-        self.advance();
-        
-        let component_type = match self.peek() {
-            Token::Window => Some(UiComponentType::Window),
-            Token::Column => Some(UiComponentType::Column),
-            Token::Row => Some(UiComponentType::Row),
-            Token::Text => Some(UiComponentType::Text),
-            Token::Button => Some(UiComponentType::Button),
-            Token::Input => Some(UiComponentType::Input),
-            _ => None,
-        };
-        
-        if component_type.is_none() {
-            self.current = saved_pos;
-            return Ok(None);
-        }
-        
-        let component_type = component_type.unwrap();
-        self.advance();
-        
-        if !matches!(self.peek(), Token::GreaterThan) {
-            self.current = saved_pos;
-            return Ok(None);
-        }
-        self.advance();
-        
-        let span = Span::new(saved_pos, self.current, 0, 0);
-        
-        let mut properties = HashMap::new();
-        let mut children = Vec::new();
-        let mut events = HashMap::new();
-        
-        if matches!(self.peek(), Token::LeftBrace) {
-            self.advance();
-            
-            while !self.is_at_end() && !matches!(self.peek(), Token::RightBrace) {
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    continue;
-                }
-                
-                let prop_name = match self.peek() {
-                    Token::Identifier(name) => {
-                        let n = name.clone();
-                        self.advance();
-                        n
-                    }
-                    Token::OnTap => {
-                        self.advance();
-                        "on_tap".to_string()
-                    }
-                    Token::OnClick => {
-                        self.advance();
-                        "on_click".to_string()
-                    }
-                    Token::OnChange => {
-                        self.advance();
-                        "on_change".to_string()
-                    }
-                    Token::OnInput => {
-                        self.advance();
-                        "on_input".to_string()
-                    }
-                    Token::Identity => {
-                        self.advance();
-                        "Identity".to_string()
-                    }
-                    Token::Parent => {
-                        self.advance();
-                        "Parent".to_string()
-                    }
-                    Token::Child => {
-                        self.advance();
-                        "Child".to_string()
-                    }
-                    Token::Text => {
-                        self.advance();
-                        "value".to_string()
-                    }
-                    Token::Button => {
-                        self.advance();
-                        "label".to_string()
-                    }
-                    _ => {
-                        self.advance();
-                        continue;
-                    }
-                };
-                
-                if matches!(self.peek(), Token::Colon) {
-                    self.advance();
-                    
-                    let value = self.parse_expression()?;
-                    
-                    if prop_name == "on_tap" || prop_name == "on_click" ||
-                       prop_name == "on_change" || prop_name == "on_input" {
-                        if let Expression::Variable(var_name, _) = &value {
-                            events.insert(prop_name, var_name.clone());
-                        }
-                    } else if prop_name == "Child" || prop_name == "Parent" {
-                        children.push(value);
-                    } else if prop_name == "Identity" {
-                        if let Expression::Literal(LiteralValue::String(id), _) = &value {
-                            properties.insert("Identity".to_string(), Expression::Literal(LiteralValue::String(id.clone()), span));
-                        }
-                    } else {
-                        properties.insert(prop_name, value);
-                    }
-                } else if prop_name == "Identity" {
-                    if let Token::Identifier(id) = self.peek() {
-                        let id = id.clone();
-                        self.advance();
-                        properties.insert("Identity".to_string(), Expression::Literal(LiteralValue::String(id), span));
-                    }
-                }
-                
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                }
-            }
-            
-            if matches!(self.peek(), Token::RightBrace) {
-                self.advance();
-            }
-        }
-        
-        Ok(Some(Expression::UiComponent {
-            component_type,
-            identity: None,
-            properties,
-            children,
-            events,
-            span,
-        }))
-    }
-    
+
     fn parse_function_call(&mut self) -> Result<Expression, SlateError> {
         let name = self.consume_identifier();
         let span = Span::new(self.current, self.current, 0, 0);
-        
+
         if !matches!(self.peek(), Token::LessThan) {
             return Err(ErrorBuilder::missing_angle_open(
                 &name,
@@ -1240,12 +1051,12 @@ impl Parser {
             .with_suggestion(&format!("{}<...>", name)));
         }
         self.advance();
-        
+
         let mut arguments = Vec::new();
-        
+
         if !matches!(self.peek(), Token::GreaterThan) {
             arguments.push(self.parse_expression()?);
-            
+
             while matches!(self.peek(), Token::Comma) {
                 self.advance();
                 if matches!(self.peek(), Token::GreaterThan) {
@@ -1254,7 +1065,7 @@ impl Parser {
                 arguments.push(self.parse_expression()?);
             }
         }
-        
+
         if !matches!(self.peek(), Token::GreaterThan) {
             return Err(ErrorBuilder::missing_angle_close(
                 &name,
@@ -1265,28 +1076,19 @@ impl Parser {
             .with_suggestion(&format!("{}<...>", name)));
         }
         self.advance();
-        
-        Ok(Expression::FunctionCall {
-            name,
-            arguments,
-            span,
-        })
+
+        Ok(Expression::FunctionCall { name, arguments, span })
     }
-    
+
     fn parse_property_access(&mut self, object: Expression) -> Result<Expression, SlateError> {
         let span = object.span();
         self.advance();
-        
+
         let property = match self.peek() {
             Token::Identifier(name) => {
                 let name = name.clone();
                 self.advance();
                 name
-            }
-            Token::Window | Token::Column | Token::Row | Token::Text |
-            Token::Button | Token::Input | Token::Parent | Token::Child | Token::Rewrite => {
-                let token = self.advance();
-                format!("{:?}", token)
             }
             _ => {
                 return Err(ErrorBuilder::generic(
@@ -1298,10 +1100,10 @@ impl Parser {
                 .with_source(self.get_current_line()));
             }
         };
-        
+
         if matches!(self.peek(), Token::LeftParen) {
             self.advance();
-            
+
             let mut arguments = Vec::new();
             if !matches!(self.peek(), Token::RightParen) {
                 arguments.push(self.parse_expression()?);
@@ -1313,7 +1115,7 @@ impl Parser {
                     arguments.push(self.parse_expression()?);
                 }
             }
-            
+
             if !matches!(self.peek(), Token::RightParen) {
                 return Err(ErrorBuilder::bracket_error(
                     self.current_line(),
@@ -1323,7 +1125,7 @@ impl Parser {
                 .with_suggestion("Expected ')' to close method call"));
             }
             self.advance();
-            
+
             Ok(Expression::MethodCall {
                 object: Box::new(object),
                 method: property,
@@ -1338,7 +1140,7 @@ impl Parser {
             })
         }
     }
-    
+
     fn parse_function_call_paren_with_name(&mut self, name: String, span: Span) -> Result<Expression, SlateError> {
         if !matches!(self.peek(), Token::LeftParen) {
             return Err(ErrorBuilder::bracket_error(
@@ -1349,12 +1151,12 @@ impl Parser {
             .with_suggestion(&format!("{}(...)", name)));
         }
         self.advance();
-        
+
         let mut arguments = Vec::new();
-        
+
         if !matches!(self.peek(), Token::RightParen) {
             arguments.push(self.parse_expression()?);
-            
+
             while matches!(self.peek(), Token::Comma) {
                 self.advance();
                 if matches!(self.peek(), Token::RightParen) {
@@ -1363,7 +1165,7 @@ impl Parser {
                 arguments.push(self.parse_expression()?);
             }
         }
-        
+
         if !matches!(self.peek(), Token::RightParen) {
             return Err(ErrorBuilder::bracket_error(
                 self.current_line(),
@@ -1373,29 +1175,25 @@ impl Parser {
             .with_suggestion("Expected ')' to close function call"));
         }
         self.advance();
-        
-        Ok(Expression::FunctionCall {
-            name,
-            arguments,
-            span,
-        })
+
+        Ok(Expression::FunctionCall { name, arguments, span })
     }
-    
+
     fn parse_function_call_paren(&mut self) -> Result<Expression, SlateError> {
         let name = self.consume_identifier();
         let span = Span::new(self.current, self.current, 0, 0);
         self.parse_function_call_paren_with_name(name, span)
     }
-    
+
     fn parse_expression_list_paren(&mut self) -> Result<Vec<Expression>, SlateError> {
         let mut expressions = Vec::new();
-        
+
         if matches!(self.peek(), Token::RightParen) {
             return Ok(expressions);
         }
-        
+
         expressions.push(self.parse_expression()?);
-        
+
         while matches!(self.peek(), Token::Comma) {
             self.advance();
             if matches!(self.peek(), Token::RightParen) {
@@ -1403,14 +1201,14 @@ impl Parser {
             }
             expressions.push(self.parse_expression()?);
         }
-        
+
         Ok(expressions)
     }
-    
+
     fn parse_identifier_list(&mut self) -> Result<Vec<String>, SlateError> {
         let mut identifiers = Vec::new();
         identifiers.push(self.consume_identifier());
-        
+
         while matches!(self.peek(), Token::Comma) {
             self.advance();
             if matches!(self.peek(), Token::GreaterThan) {
@@ -1418,14 +1216,14 @@ impl Parser {
             }
             identifiers.push(self.consume_identifier());
         }
-        
+
         Ok(identifiers)
     }
-    
+
     fn parse_array_literal(&mut self) -> Result<Expression, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         self.advance();
-        
+
         let mut elements = Vec::new();
         if !matches!(self.peek(), Token::RightBracket) {
             elements.push(self.parse_expression()?);
@@ -1437,7 +1235,7 @@ impl Parser {
                 elements.push(self.parse_expression()?);
             }
         }
-        
+
         if !matches!(self.peek(), Token::RightBracket) {
             return Err(ErrorBuilder::bracket_error(
                 self.current_line(),
@@ -1447,14 +1245,14 @@ impl Parser {
             .with_suggestion("Expected ']' to close array"));
         }
         self.advance();
-        
+
         Ok(Expression::Array(elements, span))
     }
-    
+
     fn parse_object_literal(&mut self) -> Result<Expression, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         self.advance();
-        
+
         let mut properties = HashMap::new();
         while !matches!(self.peek(), Token::RightBrace) && !self.is_at_end() {
             let key = match self.peek() {
@@ -1471,7 +1269,7 @@ impl Parser {
                 }
             };
             self.advance();
-            
+
             if !matches!(self.peek(), Token::Colon) {
                 return Err(ErrorBuilder::generic(
                     ErrorCode::BracketError,
@@ -1482,15 +1280,15 @@ impl Parser {
                 .with_source(self.get_current_line()));
             }
             self.advance();
-            
+
             let value = self.parse_expression()?;
             properties.insert(key, value);
-            
+
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             }
         }
-        
+
         if !matches!(self.peek(), Token::RightBrace) {
             return Err(ErrorBuilder::missing_close_brace(
                 "object",
@@ -1500,10 +1298,10 @@ impl Parser {
             .with_source(self.get_current_line()));
         }
         self.advance();
-        
+
         Ok(Expression::Object(properties, span))
     }
-    
+
     fn parse_number_literal(&mut self) -> Result<Expression, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         if let Token::Number(value) = self.advance() {
@@ -1518,7 +1316,7 @@ impl Parser {
             .with_source(self.get_current_line()))
         }
     }
-    
+
     fn parse_float_literal(&mut self) -> Result<Expression, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         if let Token::Float(value) = self.advance() {
@@ -1533,7 +1331,7 @@ impl Parser {
             .with_source(self.get_current_line()))
         }
     }
-    
+
     fn parse_string_literal(&mut self) -> Result<Expression, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         if let Token::String(value) = self.advance() {
@@ -1548,7 +1346,7 @@ impl Parser {
             .with_source(self.get_current_line()))
         }
     }
-    
+
     fn parse_boolean_literal(&mut self) -> Result<Expression, SlateError> {
         let span = Span::new(self.current, self.current, 0, 0);
         match self.advance() {
@@ -1563,7 +1361,7 @@ impl Parser {
             .with_source(self.get_current_line())),
         }
     }
-    
+
     fn consume_identifier(&mut self) -> String {
         if let Token::Identifier(name) = self.advance() {
             name.clone()
@@ -1571,7 +1369,7 @@ impl Parser {
             String::new()
         }
     }
-    
+
     fn peek_next_less_than(&self) -> bool {
         if self.current + 1 < self.tokens.len() {
             matches!(self.tokens[self.current + 1], Token::LessThan)
@@ -1579,7 +1377,7 @@ impl Parser {
             false
         }
     }
-    
+
     fn peek_next_paren(&self) -> bool {
         if self.current + 1 < self.tokens.len() {
             matches!(self.tokens[self.current + 1], Token::LeftParen)
@@ -1587,7 +1385,7 @@ impl Parser {
             false
         }
     }
-    
+
     fn peek_next_assign(&self) -> bool {
         if self.current + 1 < self.tokens.len() {
             matches!(self.tokens[self.current + 1], Token::Equal)
@@ -1595,13 +1393,13 @@ impl Parser {
             false
         }
     }
-    
+
     fn advance(&mut self) -> Token {
         let token = self.tokens[self.current].clone();
         self.current += 1;
         token
     }
-    
+
     fn peek(&self) -> &Token {
         if self.current < self.tokens.len() {
             &self.tokens[self.current]
@@ -1609,7 +1407,7 @@ impl Parser {
             &Token::EOF
         }
     }
-    
+
     fn is_at_end(&self) -> bool {
         self.current >= self.tokens.len() || matches!(self.peek(), Token::EOF)
     }
@@ -1619,7 +1417,7 @@ impl Parser {
             let pos = self.current;
             let mut line = 1;
             let mut chars_seen = 0;
-            
+
             for ch in self.source.chars() {
                 if chars_seen >= pos {
                     break;
@@ -1629,7 +1427,7 @@ impl Parser {
                 }
                 chars_seen += 1;
             }
-            
+
             line
         } else {
             1
@@ -1640,7 +1438,7 @@ impl Parser {
         if self.current < self.tokens.len() {
             let pos = self.current;
             let mut last_newline = 0;
-            
+
             for (i, _ch) in self.source.chars().enumerate() {
                 if i >= pos {
                     break;
@@ -1649,13 +1447,13 @@ impl Parser {
                     last_newline = i + 1;
                 }
             }
-            
+
             pos - last_newline + 1
         } else {
             1
         }
     }
-    
+
     fn get_current_line(&self) -> String {
         let line_num = self.current_line();
         if line_num > 0 && line_num <= self.source_lines.len() {

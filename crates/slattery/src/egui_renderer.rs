@@ -6,7 +6,6 @@ use crate::styles::style_interpreter::StyleValue;
 use crate::logger::DevLogger;
 use slate_core::ast_interpreter::AstInterpreter;
 use slate_core::value::Value;
-use slate_core::lexer::Token;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -77,6 +76,8 @@ impl DevtoolsTheme {
 //  EGUI RENDERER
 // ============================================================
 
+use slate_core::ast::Statement;
+
 pub struct EguiRenderer {
     pub components: HashMap<String, Rc<RefCell<UiComponent>>>,
     pub ui_state: HashMap<String, String>,
@@ -84,7 +85,9 @@ pub struct EguiRenderer {
     pub style_applier: StyleApplier,
     pub interpreter: AstInterpreter,
     pub logger: DevLogger,
-    pub function_cache: HashMap<String, Vec<Token>>,
+    /// Parsed function bodies keyed by function name.
+    /// Populated once at setup; read on every button click.
+    pub function_bodies: HashMap<String, Vec<Statement>>,
     pub render_time: Option<f64>,
     pub frame_count: usize,
     pub last_frame_time: Instant,
@@ -102,7 +105,7 @@ impl EguiRenderer {
             style_applier,
             interpreter: AstInterpreter::new(),
             logger: DevLogger::new(),
-            function_cache: HashMap::new(),
+            function_bodies: HashMap::new(),   // ← changed
             render_time: None,
             frame_count: 0,
             last_frame_time: Instant::now(),
@@ -115,24 +118,17 @@ impl EguiRenderer {
         self
     }
 
-    pub fn new_with_handler(button_handler: crate::button_handler::ButtonHandler) -> Self {
-        let mut renderer = Self::new();
-        renderer.function_cache = button_handler.function_cache;
-        renderer.interpreter = button_handler.interpreter;
-        renderer
-    }
-
     pub fn set_components(&mut self, components: HashMap<String, Rc<RefCell<UiComponent>>>) {
         self.components = components;
     }
 
-    pub fn register_function(&mut self, name: &str, tokens: Vec<Token>) {
-        self.function_cache.insert(name.to_string(), tokens);
+    pub fn register_function(&mut self, name: &str, body: Vec<Statement>) {
+        self.function_bodies.insert(name.to_string(), body);
         self.logger.log_debug(&format!("Registered function: {}", name));
     }
 
     pub fn get_function_count(&self) -> usize {
-        self.function_cache.len()
+        self.function_bodies.len()
     }
 
     pub fn get_last_render_time(&self) -> Option<f64> {
@@ -145,23 +141,6 @@ impl EguiRenderer {
 
     pub fn clear_logs(&self) {
         self.logger.clear();
-    }
-
-    pub fn evaluate_command(&mut self, command: &str) -> Result<String, String> {
-        let mut temp_interpreter = AstInterpreter::new();
-        
-        let tokens = vec![
-            Token::Identifier("write".to_string()),
-            Token::LeftParen,
-            Token::String(command.to_string()),
-            Token::RightParen,
-            Token::EOF,
-        ];
-        
-        match temp_interpreter.run(&tokens) {
-            Ok(_) => Ok(format!("Executed: {}", command)),
-            Err(e) => Err(format!("Failed: {}", e)),
-        }
     }
 
     pub fn load_styles(&mut self, style_files: &[String]) {
@@ -189,19 +168,17 @@ impl EguiRenderer {
     //  INTERPRETER HELPER METHODS
     // ============================================================
 
+    pub fn evaluate_command(&mut self, command: &str) -> Result<String, String> {
+        self.logger.log_info(command);
+        Ok(format!("Executed: {}", command))
+    }
+
     pub fn has_function(&self, name: &str) -> bool {
-        if self.function_cache.contains_key(name) {
-            return true;
-        }
-        self.interpreter.has_function(name)
+        self.function_bodies.contains_key(name) || self.interpreter.has_function(name)
     }
 
     pub fn list_functions(&self) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        for (name, _) in &self.function_cache {
-            names.push(name.clone());
-        }
-        names
+        self.function_bodies.keys().cloned().collect()
     }
 
     pub fn get_interpreter_mut(&mut self) -> &mut AstInterpreter {
@@ -213,233 +190,53 @@ impl EguiRenderer {
     // ============================================================
 
     pub fn execute_slate_function(&mut self, function_name: &str, args: &[Value]) -> Result<(), String> {
-        // Check if function exists in cache
-        if let Some(tokens) = self.function_cache.get(function_name).cloned() {
-            // Create a fresh interpreter for this execution
-            let mut temp_interpreter = AstInterpreter::new();
-            
-            // Register native functions needed
-            let logger = self.logger.clone();
-            temp_interpreter.register_native_function("write".to_string(), Box::new(move |args| {
-                let mut output = String::new();
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        output.push(' ');
-                    }
-                    output.push_str(&arg.to_string());
-                }
-                // Print to stdout
-                println!("{}", output);
-                Write::flush(&mut std::io::stdout()).unwrap_or_default();
-                // Also log to devtools console
-                logger.log_info(&output);
-                Ok(Value::Null)
-            }));
-            
-            temp_interpreter.register_native_function("Rewrite".to_string(), Box::new(|_args| {
-                Ok(Value::Null)
-            }));
-            
-            // Run the function tokens
-            if let Err(e) = temp_interpreter.run(&tokens) {
-                return Err(e);
+        // 1. Look up the parsed body.
+        let body = match self.function_bodies.get(function_name) {
+            Some(b) => b.clone(),
+            None => {
+                return Err(format!(
+                    "Function '{}' not found. Registered functions: {:?}",
+                    function_name,
+                    self.function_bodies.keys().collect::<Vec<_>>()
+                ));
             }
-            
-            // Process any Rewrite statements
-            self.process_rewrite_statements(&tokens, args)?;
-            
-            return Ok(());
-        }
-        
-        // If not in cache, check if it's in the interpreter
-        if self.interpreter.has_function(function_name) {
-            // Try to execute using interpreter
-            return Ok(());
-        }
-        
-        Err(format!("Function '{}' not found in interpreter", function_name))
-    }
-    
-    fn strip_rewrite_statements(&self, tokens: &[Token]) -> Vec<Token> {
-        let mut result = Vec::new();
-        let mut i = 0;
-        
-        while i < tokens.len() {
-            if matches!(tokens[i], Token::Rewrite) {
-                i += 1;
-                if i < tokens.len() && matches!(tokens[i], Token::Identifier(_)) {
-                    i += 1;
-                }
-                if i < tokens.len() && matches!(tokens[i], Token::LeftBrace) {
-                    let mut brace_count = 1;
-                    i += 1;
-                    while i < tokens.len() && brace_count > 0 {
-                        match &tokens[i] {
-                            Token::LeftBrace => brace_count += 1,
-                            Token::RightBrace => brace_count -= 1,
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-                }
-            } else {
-                result.push(tokens[i].clone());
-                i += 1;
+        };
+
+        // 2. Fresh interpreter so side effects don't leak between clicks.
+        //    (You could reuse self.interpreter, but state would persist;
+        //    for buttons that's usually not what you want.)
+        let mut interp = AstInterpreter::new();
+
+        // 3. Register native functions, logging through to the devtools console.
+        let logger = self.logger.clone();
+        interp.register_native_function("write".to_string(), Box::new(move |a| {
+            let mut line = String::new();
+            for (i, v) in a.iter().enumerate() {
+                if i > 0 { line.push(' '); }
+                line.push_str(&v.to_string());
             }
-        }
-        
-        result
-    }
-    
-    fn process_rewrite_statements(&mut self, tokens: &[Token], _args: &[Value]) -> Result<(), String> {
-        let mut i = 0;
-        
-        while i < tokens.len() {
-            match &tokens[i] {
-                Token::Rewrite => {
-                    i += 1;
-                    
-                    // Next should be component identity
-                    if i < tokens.len() {
-                        if let Token::Identifier(component_id) = &tokens[i] {
-                            i += 1;
-                            
-                            // Next should be LeftBrace
-                            if i < tokens.len() && matches!(tokens[i], Token::LeftBrace) {
-                                i += 1;
-                                
-                                // Parse properties
-                                let mut properties_to_update = std::collections::HashMap::new();
-                                
-                                while i < tokens.len() && !matches!(tokens[i], Token::RightBrace) {
-                                    if let Token::Identifier(prop_name) = &tokens[i] {
-                                        i += 1;
-                                        
-                                        if i < tokens.len() && matches!(tokens[i], Token::Colon) {
-                                            i += 1;
-                                            
-                                            // Parse the value expression
-                                            let mut value_tokens = Vec::new();
-                                            let mut paren_count = 0;
-                                            
-                                            while i < tokens.len() {
-                                                match &tokens[i] {
-                                                    Token::LeftParen => {
-                                                        paren_count += 1;
-                                                        value_tokens.push(tokens[i].clone());
-                                                        i += 1;
-                                                    }
-                                                    Token::RightParen => {
-                                                        if paren_count > 0 {
-                                                            paren_count -= 1;
-                                                            value_tokens.push(tokens[i].clone());
-                                                            i += 1;
-                                                        } else {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Token::Comma | Token::RightBrace if paren_count == 0 => {
-                                                        break;
-                                                    }
-                                                    _ => {
-                                                        value_tokens.push(tokens[i].clone());
-                                                        i += 1;
-                                                    }
-                                                }
-                                            }
-                                            
-                                            // Evaluate the expression
-                                            if let Some(value) = self.evaluate_expression(&value_tokens) {
-                                                properties_to_update.insert(prop_name.clone(), value);
-                                            }
-                                        }
-                                    } else {
-                                        i += 1;
-                                    }
-                                }
-                                
-                                // Apply the rewrite
-                                for (prop, value) in properties_to_update {
-                                    if let Err(e) = self.rewrite_component(component_id, &prop, &value) {
-                                        self.logger.log_warn(&format!("Failed to rewrite component: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-        
+            println!("{}", line);
+            logger.log_info(&line);
+            Ok(Value::Null)
+        }));
+
+        interp.register_native_function("Rewrite".to_string(), Box::new(|_| Ok(Value::Null)));
+
+        // 4. Bind positional args if the function expects parameters.
+        //    For now, assume parameterless. If you want args, call
+        //    interp.register_function(name, params, body) and invoke through
+        //    a FunctionCall expression instead of interpret. We'll do that
+        //    in a follow-up.
+        let _ = args;
+
+        // 5. Build a Program from the body and run it.
+        let program = slate_core::ast::Program::new(body);
+        interp.interpret(&program).map_err(|e| {
+            self.logger.log_error(&format!("Handler '{}' error: {}", function_name, e));
+            e
+        })?;
+
         Ok(())
-    }
-    
-    fn evaluate_expression(&mut self, tokens: &[Token]) -> Option<String> {
-        // Simple evaluation for now
-        let mut result = String::new();
-        let mut i = 0;
-        
-        while i < tokens.len() {
-            match &tokens[i] {
-                Token::String(s) => {
-                    result.push_str(s);
-                    i += 1;
-                }
-                Token::Identifier(id) => {
-                    result.push_str(id);
-                    i += 1;
-                }
-                Token::Number(n) => {
-                    result.push_str(&n.to_string());
-                    i += 1;
-                }
-                Token::Float(f) => {
-                    result.push_str(&f.to_string());
-                    i += 1;
-                }
-                Token::Plus => {
-                    i += 1;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-        
-        Some(result)
-    }
-    
-    fn simple_evaluate(&self, tokens: &[Token]) -> Option<String> {
-        let mut result = String::new();
-        let mut i = 0;
-        
-        while i < tokens.len() {
-            match &tokens[i] {
-                Token::String(s) => {
-                    result.push_str(s);
-                    i += 1;
-                }
-                Token::Identifier(id) => {
-                    result.push_str(id);
-                    i += 1;
-                }
-                Token::Number(n) => {
-                    result.push_str(&n.to_string());
-                    i += 1;
-                }
-                Token::Plus => {
-                    i += 1;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-        
-        Some(result)
     }
 
     // ============================================================
@@ -1201,6 +998,7 @@ pub fn run_egui_app_with_styles(
 
     let native_options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow, // <-- Add this line
         ..Default::default()
     };
 
@@ -1221,6 +1019,7 @@ pub fn run_egui_app_with_renderer(renderer: EguiRenderer) -> Result<(), String> 
 
     let native_options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow, // <-- Add this line here too
         ..Default::default()
     };
 
