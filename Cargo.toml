@@ -25,6 +25,7 @@ members = [
     "crates/slate-core",
     "crates/slate-sfile",
     "crates/slattery",
+    "crates/slattery-cli",
 ]
 
 [workspace.package]

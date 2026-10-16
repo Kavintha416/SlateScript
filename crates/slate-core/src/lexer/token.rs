@@ -35,6 +35,14 @@ pub enum Token {
     True,
     False,
 
+    /// Hex colour literal, e.g. `#FF3B30` or `#FFF`.
+    ///
+    /// Emitted by the lexer when it sees `#` followed by 3 or 6 hex
+    /// digits. Used by the Slattery extension's `style` blocks, but
+    /// the token itself is a core language construct so any extension
+    /// can consume it.
+    HexColor(String),
+
     // === Operators ===
     Plus,
     Minus,

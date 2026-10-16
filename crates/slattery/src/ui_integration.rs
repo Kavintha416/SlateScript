@@ -45,6 +45,7 @@ impl UiFramework {
         &mut self,
         program: &Program,
         script_path: Option<&Path>,
+        icon: Option<egui::IconData>,
     ) -> Result<(), String> {
         if let Some(path) = script_path {
             self.sfile_extension.set_current_file(path);
@@ -63,7 +64,11 @@ impl UiFramework {
         // 2. Build renderer and register everything.
         let mut renderer = EguiRenderer::new();
         renderer.set_components(components);
+        renderer.icon = icon;   // NEW
 
+        for stmt in &program.statements {
+            self.collect_styles(stmt, &mut renderer);
+        }
         for stmt in &program.statements {
             self.collect_functions(stmt, &mut renderer);
         }
@@ -213,6 +218,53 @@ impl UiFramework {
             Statement::While { body, .. } => {
                 for s in body {
                     self.collect_functions(s, renderer);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk the AST and feed every `Style:` extension node to the
+    /// renderer's style engine.
+    fn collect_styles(&self, stmt: &Statement, renderer: &mut EguiRenderer) {
+        match stmt {
+            Statement::Expression(Expression::Extension { name, type_name, .. }) => {
+                if name == "slattery" && type_name.starts_with("Style:") {
+                    if let Err(e) = renderer.load_style_from_encoded(type_name) {
+                        renderer.logger.log_warn(&format!(
+                            "Failed to load style: {}", e
+                        ));
+                    }
+                }
+            }
+            Statement::If {
+                then_branch,
+                elif_branches,
+                else_branch,
+                ..
+            } => {
+                for s in then_branch {
+                    self.collect_styles(s, renderer);
+                }
+                for (_, body) in elif_branches {
+                    for s in body {
+                        self.collect_styles(s, renderer);
+                    }
+                }
+                if let Some(body) = else_branch {
+                    for s in body {
+                        self.collect_styles(s, renderer);
+                    }
+                }
+            }
+            Statement::While { body, .. } => {
+                for s in body {
+                    self.collect_styles(s, renderer);
+                }
+            }
+            Statement::FunctionDefinition { body, .. } => {
+                for s in body {
+                    self.collect_styles(s, renderer);
                 }
             }
             _ => {}

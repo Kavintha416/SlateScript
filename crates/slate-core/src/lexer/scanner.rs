@@ -94,7 +94,7 @@ impl Lexer {
                 '[' => { tokens.push(Token::LeftBracket);  self.pos += 1; }
                 ']' => { tokens.push(Token::RightBracket); self.pos += 1; }
 
-                // ---- '#' handling: annotations ----
+                // ---- '#' handling: annotation, hex color, or error ----
                 '#' if self.pos + 1 < self.chars.len()
                     && self.chars[self.pos + 1] == '[' => {
                     // #[Name] — annotation
@@ -124,9 +124,31 @@ impl Lexer {
                     self.pos += 1; // skip ']'
                     tokens.push(Token::Annotation { name });
                 }
+                '#' if self.pos + 1 < self.chars.len()
+                    && self.chars[self.pos + 1].is_ascii_hexdigit() => {
+                    // #RRGGBB or #RGB — hex color literal
+                    self.pos += 1; // skip '#'
+                    let mut hex = String::new();
+                    while self.pos < self.chars.len()
+                        && self.chars[self.pos].is_ascii_hexdigit() {
+                        hex.push(self.chars[self.pos]);
+                        self.pos += 1;
+                    }
+                    if hex.len() != 3 && hex.len() != 6 {
+                        return Err(LexerError::new(
+                            &format!(
+                                "Invalid hex color '#{}': expected 3 or 6 hex digits",
+                                hex
+                            ),
+                            self.pos,
+                            self.line,
+                        ));
+                    }
+                    tokens.push(Token::HexColor(format!("#{}", hex)));
+                }
                 '#' => {
                     return Err(LexerError::new(
-                        "Unexpected character: '#' (did you mean '#[Name]'?)",
+                        "Unexpected character: '#' (expected '#[Name]' or a hex color like '#FF0000')",
                         self.pos,
                         self.line,
                     ));

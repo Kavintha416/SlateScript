@@ -85,13 +85,12 @@ pub struct EguiRenderer {
     pub style_applier: StyleApplier,
     pub interpreter: AstInterpreter,
     pub logger: DevLogger,
-    /// Parsed function bodies keyed by function name.
-    /// Populated once at setup; read on every button click.
     pub function_bodies: HashMap<String, Vec<Statement>>,
     pub render_time: Option<f64>,
     pub frame_count: usize,
     pub last_frame_time: Instant,
     pub fps: f64,
+    pub icon: Option<egui::IconData>,
 }
 
 impl EguiRenderer {
@@ -105,11 +104,12 @@ impl EguiRenderer {
             style_applier,
             interpreter: AstInterpreter::new(),
             logger: DevLogger::new(),
-            function_bodies: HashMap::new(),   // ← changed
+            function_bodies: HashMap::new(),
             render_time: None,
             frame_count: 0,
             last_frame_time: Instant::now(),
             fps: 0.0,
+            icon: None,        // <-- this line
         }
     }
 
@@ -1013,22 +1013,25 @@ pub fn run_egui_app_with_styles(
 }
 
 pub fn run_egui_app_with_renderer(renderer: EguiRenderer) -> Result<(), String> {
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
         .with_min_inner_size([400.0, 300.0]);
 
+    // Apply the window icon if one was set on the renderer.
+    if let Some(icon) = &renderer.icon {
+        viewport = viewport.with_icon(icon.clone());
+    }
+
     let native_options = eframe::NativeOptions {
         viewport,
-        renderer: eframe::Renderer::Glow, // <-- Add this line here too
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
     eframe::run_native(
         "SlateScript App",
         native_options,
-        Box::new(|_cc| {
-            Ok(Box::new(SlatteryApp::new_with_renderer(renderer)))
-        }),
+        Box::new(|_cc| Ok(Box::new(SlatteryApp::new_with_renderer(renderer)))),
     )
     .map_err(|e| e.to_string())
 }
@@ -1062,7 +1065,44 @@ impl EguiRenderer {
             }
         }
     }
-    
+
+    /// Decode a `Style:Target:prop=val;prop=val;` string produced by the
+    /// Slattery extension and register the resulting rule with the style
+    /// engine.
+    pub fn load_style_from_encoded(&mut self, encoded: &str) -> Result<(), String> {
+        // Strip the leading `Style:` marker.
+        let body = encoded.strip_prefix("Style:")
+            .ok_or_else(|| format!("Not a style encoding: {}", encoded))?;
+
+        // Split target from the rule body.
+        let mut parts = body.splitn(2, ':');
+        let target = parts.next().ok_or("Missing target in style encoding")?;
+        let rules = parts.next().unwrap_or("");
+
+        let mut properties = HashMap::new();
+
+        for pair in rules.split(';') {
+            if pair.is_empty() {
+                continue;
+            }
+            let mut kv = pair.splitn(2, '=');
+            let key = kv.next().ok_or("Missing key")?;
+            let value = kv.next().ok_or("Missing value")?;
+            properties.insert(key.to_string(), parse_style_value(value));
+        }
+
+        let rule = crate::styles::style_interpreter::StyleRule {
+            selector: target.to_string(),
+            properties,
+            state: crate::styles::style_interpreter::StyleState::Normal,
+            important: false,
+        };
+
+        self.style_engine.borrow_mut().add_rule(rule);
+        self.logger.log_debug(&format!("Loaded style rule for '{}'", target));
+        Ok(())
+    }
+
     // Image component (FIXED - no Result returned)
     pub fn render_image(&mut self, ui: &mut egui::Ui, comp: &UiComponent) {
         let src = comp.get_property("src")
@@ -1112,4 +1152,43 @@ impl EguiRenderer {
             }
         }
     }
+}
+
+/// Parse a style value string into a `StyleValue`.
+///
+/// Handles:
+///   `#RRGGBB` / `#RGB` → Color
+///   `18px`, `1.5em`, `50%` → Unit
+///   `42` → Number
+///   `white`, `bold`, etc. → String
+fn parse_style_value(s: &str) -> crate::styles::style_interpreter::StyleValue {
+    use crate::styles::style_interpreter::StyleValue;
+
+    // Hex colour
+    if s.starts_with('#') {
+        return StyleValue::Color(s.to_string());
+    }
+
+    // Number with unit suffix (letters or %)
+    if let Some(pos) = s.find(|c: char| c.is_alphabetic() || c == '%') {
+        if let Ok(n) = s[..pos].parse::<f64>() {
+            return StyleValue::Unit(n, s[pos..].to_string());
+        }
+    }
+
+    // Plain number
+    if let Ok(n) = s.parse::<f64>() {
+        return StyleValue::Number(n);
+    }
+
+    // Boolean
+    if s == "true" {
+        return StyleValue::Boolean(true);
+    }
+    if s == "false" {
+        return StyleValue::Boolean(false);
+    }
+
+    // Fallback: string
+    StyleValue::String(s.to_string())
 }

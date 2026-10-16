@@ -1,0 +1,17 @@
+[project]
+name = "app"
+version = "0.1.0"
+authors = ["Your Name <your@email.com>"]
+description = "A Slattery application"
+edition = "2024"
+
+[app]
+entry = "src/main.st"
+assets_dir = "assets"
+
+[dependencies]
+slattery = "1.0.0"
+
+[build]
+output_dir = "build"
+release = false

@@ -1,24 +1,27 @@
 # SlateScript
 
-**A modern, elegant programming language with built-in UI framework**
-
-SlateScript is a versatile programming language that combines clean syntax with powerful UI capabilities. Write once, run everywhere - from console applications to native GUI apps with the built-in Slattery UI framework.
+**A small, extensible scripting language. UI, file imports, and
+(eventually) machine learning are extensions, not built-ins.**
 
 ## Disclaimer
 
 This project is in its beta stage expect lots of bugs!
 
-## Features
+## What works today
 
-- **Clean, Intuitive Syntax** - Simple and readable, designed for productivity
-- **Built-in UI Framework (Slattery)** - Create native GUI applications using CSS-like styling
-- **Package Manager (SLIT)** - Manage dependencies and extensions
-- **Rich Type System** - Strings, integers, floats, and booleans
-- **Control Flow** - `if`/`elif`/`else` statements and `loop` for iteration
-- **Functions** - User-defined functions with parameters
-- **Expression Evaluation** - Full arithmetic and comparison operators
-- **CSS Styling** - Style your UI components with `.sts` files
-- **Developer Tools** - Built-in devtools panel for debugging and inspection
+- Variables (`make`)
+- Functions (`func name<a, b> { ... }` and calls `name<1, 2>`)
+- Control flow (`if` / `elif` / `else`, `loop`)
+- Console output (`write(...)`)
+- Arithmetic and comparison operators
+- Strings, integers, floats, booleans, null
+- Arrays and objects
+- String and array methods (`.len`, `.to_upper`, `.push`, `.get`, etc.)
+- **Annotations** — `#[name]` that transforms the following statement
+  - `#[struct]` — named struct values with field read/write
+- **Extensions** — plug in new keywords and behavior
+  - `sfile` — import functions from other `.st` files
+  - `slattery` — native GUI applications via egui
 
 ## Installation
 
@@ -26,9 +29,8 @@ This project is in its beta stage expect lots of bugs!
 
 ```bash
 git clone <repo>
-cd slatescript
-cargo build --release
-sudo cp target/release/slate /usr/local/bin/
+cd SlateScript-main
+cargo install --path .
 ```
 
 Beware that this is an experimental release and most features are yet to come
@@ -90,7 +92,7 @@ make is_equal = (5 + 5) == 10
 make message = "Hello " + "World"
 ```
 
-### i
+### loops with counters
 
 ```st
 // Counted loop
@@ -109,27 +111,11 @@ loop 10 with i {
 you can run using the executable by specifying the path
 
 ```bash
-slate.exe run (yourfile.st)
+slate.exe myfile.st
 ```
 
-or installing it via path by
+or if you installed it to path use
 
 ```bash
-slate run (yourfile.st)
-```
-
-### How to install to path?
-
-```bash
-# Add to User PATH (doesn't need admin)
-$SLATE_PATH = "C:\Users\$env:USERNAME\SlateScript\target\release"
-
-[Environment]::SetEnvironmentVariable(
-    "Path", 
-    [Environment]::GetEnvironmentVariable("Path", "User") + ";$SLATE_PATH",
-    "User"
-)
-
-# Restart terminal and test
-slate --version
+slate myfile.st
 ```
